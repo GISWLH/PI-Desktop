@@ -55,6 +55,29 @@ export function resolveStreamingOutputTokens(input: {
 }
 
 /**
+ * True when mid-stream usage flips from a text estimate to provider
+ * `outputTokens` and the provider count is lower than the estimate. Callers
+ * must reset the sample window so monotonic clamping cannot freeze the rate
+ * at a hard `0 tok/s` without `≈`.
+ */
+export function shouldResetTokenRateWindow(input: {
+  wasEstimated: boolean;
+  nowEstimated: boolean;
+  previousTokens?: number;
+  nextTokens: number;
+}): boolean {
+  if (!input.wasEstimated || input.nowEstimated) return false;
+  if (
+    typeof input.previousTokens !== "number" ||
+    !Number.isFinite(input.previousTokens) ||
+    !Number.isFinite(input.nextTokens)
+  ) {
+    return false;
+  }
+  return input.nextTokens < input.previousTokens;
+}
+
+/**
  * Append a cumulative sample, dropping entries older than the retain horizon.
  * Tokens are forced monotonic so a noisy estimate cannot go backwards.
  */
@@ -90,10 +113,12 @@ export function appendTokenSample(
 /**
  * Sliding-window tokens/s from cumulative samples ending at `nowMs`.
  *
- * - Returns `undefined` when elapsed time is zero or below `minDurationMs`
- *   (not enough signal yet).
- * - Returns `0` when the window advanced without token growth (stall /
- *   reconnect), so the UI can show the stream is no longer producing.
+ * - Returns `undefined` when no positive output has been observed yet (hide
+ *   the chip through TTFT), or when elapsed time is zero / below
+ *   `minDurationMs` (not enough signal yet).
+ * - Returns `0` only after positive output was seen and the window advanced
+ *   without token growth (stall / reconnect), so the UI can show the stream
+ *   is no longer producing.
  * - Concentrates a late burst into a high instantaneous rate by ignoring
  *   earlier growth outside the window.
  */
@@ -125,6 +150,9 @@ export function calculateWindowedTokenRate(
     .slice()
     .sort((left, right) => left.atMs - right.atMs);
   if (ordered.length === 0) return undefined;
+
+  // Until some positive output exists, never report a stall `0` (false TTFT).
+  if (!ordered.some((sample) => sample.tokens > 0)) return undefined;
 
   const first = ordered[0];
   const latest = ordered[ordered.length - 1];

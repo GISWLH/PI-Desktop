@@ -435,6 +435,7 @@ export function LiveTokenRateLabel({ rate }: { rate: LiveTokenRate }) {
       className="working-token-rate"
       data-testid="live-token-rate"
       title={t("chat.usageThroughputLabel")}
+      aria-hidden="true"
     >
       {t(
         rate.estimated
@@ -478,7 +479,9 @@ export function WorkingIndicator({
         <span />
       </span>
       <span className="working-indicator-label">{t("chat.running")}</span>
-      {tokenRate ? <LiveTokenRateLabel rate={tokenRate} /> : null}
+      {tokenRate != null && tokenRate.tokensPerSecond !== undefined ? (
+        <LiveTokenRateLabel rate={tokenRate} />
+      ) : null}
       {elapsed > 0 ? (
         <span className="working-elapsed" aria-hidden="true">
           {formatToolDuration(elapsed)}
@@ -570,7 +573,9 @@ export function RunActivityIndicator({
         <span />
       </span>
       {labelContent}
-      {tokenRate ? <LiveTokenRateLabel rate={tokenRate} /> : null}
+      {tokenRate != null && tokenRate.tokensPerSecond !== undefined ? (
+        <LiveTokenRateLabel rate={tokenRate} />
+      ) : null}
       <span className="working-elapsed" aria-hidden="true">
         {elapsed}
       </span>
@@ -589,8 +594,7 @@ export function StreamingTokenRateIndicator({
     <div
       className="working-indicator streaming-rate-indicator"
       data-testid="streaming-rate-indicator"
-      role="status"
-      aria-live="polite"
+      aria-hidden="true"
     >
       <LiveTokenRateLabel rate={tokenRate} />
     </div>

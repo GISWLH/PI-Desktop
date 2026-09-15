@@ -1179,9 +1179,10 @@ section mirrors only marketplace/catalog items still blocking nothing.
   duration. Runtime estimates use pi-agent-core's existing four-characters-
   per-token heuristic; provider-reported usage remains the authoritative total
   and the UI labels tool rows as estimates.
-- Generation speed is a completed-turn snapshot from provider output and final
-  stream duration; active assistant streams do not show a live token-rate
-  counter.
+- Generation speed inside the inspector is a completed-turn snapshot from
+  provider output and final stream duration *(amended by D428: while a turn is
+  running, the transcript stream-health strip shows a live sliding-window
+  `tok/s` reading)*.
 - The context-window total comes from the matching `pi-ai` model metadata used
   by the agent sidecar; provider metadata and the 128K default remain fallbacks
   for unknown models.

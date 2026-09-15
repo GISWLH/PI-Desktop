@@ -48,6 +48,11 @@ test("active turns show immediate and phase-specific feedback without a progress
   assert.match(transcript, /useLiveTokenRate\(/);
   assert.match(transcript, /function LiveTokenRateLabel\(/);
   assert.match(transcript, /data-testid="live-token-rate"/);
+  assert.match(transcript, /data-testid="live-token-rate"[\s\S]*?aria-hidden="true"/);
+  assert.match(
+    transcript,
+    /tokenRate != null && tokenRate\.tokensPerSecond !== undefined/,
+  );
   assert.match(transcript, /function StreamingTokenRateIndicator\(/);
   assert.match(transcript, /data-testid="streaming-rate-indicator"/);
   assert.match(
