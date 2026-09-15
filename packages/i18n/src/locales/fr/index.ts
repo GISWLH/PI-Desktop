@@ -348,6 +348,8 @@ export const fr = {
     "usageThroughput": "{{count}} jetons/s",
     "usageThroughputEstimated": "≈ {{count}} jetons/s",
     "usageThroughputUnavailable": "—",
+    "usageLiveThroughput": "{{count}} jeton/s",
+    "usageLiveThroughputEstimated": "≈ {{count}} jeton/s",
     "usageProviderUsage": "Utilisation du fournisseur",
     "usageExact": "signalé",
     "usageInput": "Entrée",
