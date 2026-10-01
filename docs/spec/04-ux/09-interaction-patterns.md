@@ -547,7 +547,7 @@ may be retained while exactly one workspace supplies the visible shell context.
 - On every platform, opening and collapsing the visible panel change only the
   internal flex allocation; native window bounds remain unchanged. The inner
   divider updates the renderer-owned panel target from 244px upward, capped by
-  the live three-column budget, while native window edges resize only the fixed
+  the live three-column budget, while window edges resize only the fixed
   application window (ADR 0151).
 - No tool result creates or activates a work-panel tab. Review opens only from
   an explicit user action — its `+` launcher row, or the retained context the
@@ -767,7 +767,7 @@ indicator, which stays visible for the whole running turn. Prefer
 provider output usage when present; otherwise estimate from visible
 thinking+answer text and label as approximate. The rate clears when the
 turn becomes idle; the context inspector keeps the completed-turn
-generation speed (D637).
+generation speed (D639).
 
 ### 3.3 Abort UX
 
