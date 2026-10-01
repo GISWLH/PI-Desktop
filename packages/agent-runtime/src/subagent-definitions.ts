@@ -59,7 +59,7 @@ export function subagentDefinitionDir(_workspaceRoot: string): string {
 export const BUILTIN_SUBAGENT_DOCUMENTS: readonly string[] = [
   `---
 name: explorer
-description: Fast codebase search and pattern matching — find files, locate implementations and answer "where is X?" / "how does Y work?". Use when answering needs a sweep over many files and you only want the conclusion.
+description: Fast codebase search and pattern matching — find files, locate implementations and answer "where is X?" / "how does Y work?". Use when answering needs a sweep over many files and you only want the conclusion. Has Bash — use it when the task needs CLI commands (gh, git, npm, cargo, etc.).
 tools: [Read, Glob, Grep, Bash]
 ---
 
@@ -84,11 +84,16 @@ than a guess.
 </answer>`,
   `---
 name: code-reviewer
-description: Review specific code or a specific change for defects. Use for a second opinion on correctness, edge cases and missing tests before you commit.
+description: Review specific code or a specific change for defects. Use for a second opinion on correctness, edge cases and missing tests before you commit. Has NO Bash or shell access — cannot run CLI commands (gh, git, npm, etc.). If the task needs shell commands, use explorer or fixer instead.
 tools: [Read, Glob, Grep]
 ---
 
 Review only what the task names, and read enough surrounding code to judge it.
+
+- You have NO shell or terminal access. Do not attempt to run commands.
+  If the task requires CLI output (gh, git log, npm, cargo, etc.), report
+  that limitation in one sentence and stop — do not pad the report with
+  unrelated code reading.
 
 - Prefer defects that change behavior: wrong results, unhandled failures,
   broken invariants, races, resource leaks, missing test coverage.
@@ -274,6 +279,12 @@ export type LoadSubagentOptions = {
   overrideDir?: string;
   /** Documents already scanned by host-core from `~/.agents/subagents`. */
   userDocuments?: readonly UserSubagentDocument[];
+  /**
+   * Handles whose shipped definition the user turned off (D202 activation for
+   * builtins, which are constants rather than documents). Their definitions
+   * stay out of `definitions` but still reach `builtins`.
+   */
+  disabledBuiltins?: readonly string[];
 };
 
 function loadUserSubagents(documents: readonly UserSubagentDocument[]): {
@@ -298,13 +309,22 @@ function loadUserSubagents(documents: readonly UserSubagentDocument[]): {
 
 /**
  * Definitions offered to a session: the user's global documents and the
- * builtins. Load failures degrade to diagnostics: a malformed document must not
- * cost the session its other delegates, let alone its turn.
+ * builtins, minus the builtins the user turned off. Load failures degrade to
+ * diagnostics: a malformed document must not cost the session its other
+ * delegates, let alone its turn.
+ *
+ * `builtins` carries every shipped definition that still wins its handle,
+ * whether or not it is switched on, so Settings can render an off builtin as a
+ * row with its own switch; `definitions` is what `Task` may actually offer.
  */
 export async function loadSubagentDefinitions(
   workspaceRoot: string | null | undefined,
   options: LoadSubagentOptions = {},
-): Promise<{ definitions: SubagentDefinition[]; diagnostics: string[] }> {
+): Promise<{
+  definitions: SubagentDefinition[];
+  builtins: SubagentDefinition[];
+  diagnostics: string[];
+}> {
   const builtin = builtinSubagents();
   const dir =
     options.overrideDir ??
@@ -329,7 +349,21 @@ export async function loadSubagentDefinitions(
       `dropped subagents past the catalog cap: ${merged.dropped.join(", ")}`,
     );
   }
-  return { definitions: merged.definitions, diagnostics };
+  // A switched-off builtin is excluded from the delegation catalog and from
+  // nothing else: a user document of the same name still shadows it, and a
+  // handle the user re-enables needs no document of its own to come back.
+  const disabled = new Set(options.disabledBuiltins ?? []);
+  const builtins = merged.definitions.filter(
+    (definition) => definition.source === "builtin",
+  );
+  return {
+    definitions: merged.definitions.filter(
+      (definition) =>
+        !(definition.source === "builtin" && disabled.has(definition.name)),
+    ),
+    builtins,
+    diagnostics,
+  };
 }
 
 /** The stored-provider fields a pin can be resolved against. */

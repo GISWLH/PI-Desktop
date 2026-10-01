@@ -1,24 +1,23 @@
 import {
   ErrorCodes as SharedErrorCodes,
-  THINKING_LEVELS,
+  SESSION_THINKING_LEVELS,
   defaultCommandShellForPlatform,
   isCommandShellId,
-  modelIdsMatch,
   validateNetworkProxy,
+  validateSpeechSettings,
   type CommandShellId,
   type ModelBinding,
-  type ThinkingLevel,
+  type SessionThinkingLevel,
 } from "@pi-desktop/shared";
 import {
   capabilitiesFromModelConfig,
-  genericModelConfig,
-  modelConfigWithBinding,
+  type ModelConfig,
   visionFromModelConfig,
   type ThinkingCapabilities,
 } from "@pi-desktop/agent-runtime";
 import type { HostProcess } from "../host-process";
 import {
-  modelConfigFromModelsDev,
+  catalogModelConfigFor,
   type ModelsDevCatalog,
 } from "../models-dev-catalog";
 
@@ -51,7 +50,7 @@ export type RuntimeProvider = {
 export type RuntimeSession = {
   providerId?: string;
   modelId?: string;
-  thinkingLevel?: ThinkingLevel;
+  thinkingLevel?: SessionThinkingLevel;
 };
 
 export type SessionCapabilityDefaults = {
@@ -72,10 +71,13 @@ export function createProviderCatalogRuntime({
     provider: Pick<RuntimeProvider, "models">,
     modelId: string,
   ): ModelBinding | undefined =>
-    provider.models?.find((binding) => modelIdsMatch(binding.id, modelId));
+    provider.models?.find((binding) =>
+      binding.id.trim().toLowerCase() === modelId.trim().toLowerCase(),
+    );
 
   const modelsDevModelFor = (provider: RuntimeProvider, modelId: string) =>
     modelsDevCatalog.findModel({
+      providerId: provider.id,
       vendorKey: provider.vendorKey,
       baseUrl: provider.baseUrl,
       modelId,
@@ -87,18 +89,15 @@ export function createProviderCatalogRuntime({
    * the effective thinking capability for the endpoint.
    */
   const effectiveSubagentModelConfig = (
-    provider: Pick<RuntimeProvider, "models">,
+    provider: RuntimeProvider,
     modelId: string,
-    catalogModelConfig: Parameters<typeof modelConfigWithBinding>[0],
+    catalogModelConfig?: ModelConfig,
   ) => {
-    const modelConfig = modelConfigWithBinding(
-      catalogModelConfig,
-      bindingForModel(provider, modelId),
-    );
-    return {
-      modelConfig,
-      capabilities: capabilitiesFromModelConfig(modelConfig),
-    };
+    modelsDevCatalog.configureAccount(provider);
+    const modelConfig = modelsDevCatalog.modelConfigFor({
+      providerId: provider.id, vendorKey: provider.vendorKey, baseUrl: provider.baseUrl, modelId,
+    }, catalogModelConfig);
+    return { modelConfig, capabilities: capabilitiesFromModelConfig(modelConfig) };
   };
 
   const enrichProvider = <T extends RuntimeProvider>(
@@ -111,31 +110,20 @@ export function createProviderCatalogRuntime({
       provider.models?.[0]?.id ||
       provider.defaultModelId ||
       "";
-    const storedModel = bindingForModel(provider, modelId);
-    const modelsDevModel = modelsDevModelFor(provider, modelId);
-    const modelConfig = modelConfigWithBinding(
-      modelsDevModel
-        ? modelConfigFromModelsDev(modelsDevModel, provider.baseUrl)
-        : genericModelConfig(modelId, provider.baseUrl ?? ""),
-      storedModel,
-    );
+    modelsDevCatalog.configureAccount(provider);
+    const modelConfig = catalogModelConfigFor(modelsDevCatalog, {
+      providerId: provider.id, vendorKey: provider.vendorKey, baseUrl: provider.baseUrl, modelId,
+    });
     const models = provider.models?.map((binding) => {
-      const catalogModel = modelsDevModelFor(provider, binding.id);
-      if (!catalogModel) return binding;
-      const effective = modelConfigWithBinding(
-        modelConfigFromModelsDev(catalogModel, provider.baseUrl),
-        binding,
-      );
-      return {
-        ...binding,
-        contextWindow: effective.contextWindow,
-        maxTokens: effective.maxTokens,
-      };
+      const effective = catalogModelConfigFor(modelsDevCatalog, {
+        providerId: provider.id, vendorKey: provider.vendorKey, baseUrl: provider.baseUrl, modelId: binding.id,
+      });
+      return { ...binding, contextWindow: effective.contextWindow, maxTokens: effective.maxTokens, maxTokensSource: binding.maxTokensSource ?? "user" as const };
     });
     return {
       ...provider,
       ...(models ? { models } : {}),
-      ...(modelsDevModel
+      ...(modelConfig.source !== "generic"
         ? {
             contextWindow: modelConfig.contextWindow,
             maxOutputTokens: modelConfig.maxTokens,
@@ -146,10 +134,10 @@ export function createProviderCatalogRuntime({
     };
   };
 
-  const normalizeThinkingLevel = (value: unknown): ThinkingLevel =>
+  const normalizeThinkingLevel = (value: unknown): SessionThinkingLevel =>
     typeof value === "string" &&
-    (THINKING_LEVELS as readonly string[]).includes(value)
-      ? (value as ThinkingLevel)
+    (SESSION_THINKING_LEVELS as readonly string[]).includes(value)
+      ? (value as SessionThinkingLevel)
       : "off";
 
   const normalizeSettings = <T>(
@@ -160,6 +148,10 @@ export function createProviderCatalogRuntime({
     ) as T & { defaultCommandShell?: unknown };
     return {
       ...(value as T),
+      infiniteProviderRetry: (value as T & { infiniteProviderRetry?: unknown })
+        .infiniteProviderRetry === true,
+      keepAwakeWhileRunning: (value as T & { keepAwakeWhileRunning?: unknown })
+        .keepAwakeWhileRunning === true,
       defaultCommandShell: isCommandShellId(value.defaultCommandShell)
         ? value.defaultCommandShell
         : defaultCommandShellForPlatform(process.platform),
@@ -172,6 +164,10 @@ export function createProviderCatalogRuntime({
     }
     const value = settings as T & {
       defaultCommandShell?: unknown;
+      infiniteProviderRetry?: unknown;
+      keepAwakeWhileRunning?: unknown;
+      updatePreference?: unknown;
+      lastNotifiedUpdateVersion?: unknown;
       networkProxy?: unknown;
     };
     if (
@@ -182,6 +178,41 @@ export function createProviderCatalogRuntime({
         errorCode: ErrorCodes.COMMAND_SHELL_INVALID,
       });
     }
+    if (
+      Object.prototype.hasOwnProperty.call(value, "infiniteProviderRetry") &&
+      typeof value.infiniteProviderRetry !== "boolean"
+    ) {
+      throw Object.assign(new Error("infiniteProviderRetry is invalid"), {
+        errorCode: ErrorCodes.INVALID_PARAMS,
+      });
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(value, "keepAwakeWhileRunning") &&
+      typeof value.keepAwakeWhileRunning !== "boolean"
+    ) {
+      throw Object.assign(new Error("keepAwakeWhileRunning is invalid"), {
+        errorCode: ErrorCodes.INVALID_PARAMS,
+      });
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(value, "updatePreference") &&
+      value.updatePreference !== "automatic" &&
+      value.updatePreference !== "manual"
+    ) {
+      throw Object.assign(new Error("updatePreference is invalid"), {
+        errorCode: ErrorCodes.INVALID_PARAMS,
+      });
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(value, "lastNotifiedUpdateVersion") &&
+      (typeof value.lastNotifiedUpdateVersion !== "string" ||
+        value.lastNotifiedUpdateVersion.trim().length === 0 ||
+        value.lastNotifiedUpdateVersion.length > 128)
+    ) {
+      throw Object.assign(new Error("lastNotifiedUpdateVersion is invalid"), {
+        errorCode: ErrorCodes.INVALID_PARAMS,
+      });
+    }
     if (Object.prototype.hasOwnProperty.call(value, "networkProxy")) {
       const proxy = validateNetworkProxy(value.networkProxy);
       if (!proxy.ok) {
@@ -190,6 +221,11 @@ export function createProviderCatalogRuntime({
         });
       }
       value.networkProxy = proxy.value;
+    }
+    if (Object.prototype.hasOwnProperty.call(value, "speech")) {
+      (value as T & { speech?: unknown }).speech = validateSpeechSettings(
+        (value as { speech?: unknown }).speech,
+      );
     }
     return settings;
   };
@@ -202,6 +238,7 @@ export function createProviderCatalogRuntime({
       { includeDisabled },
     );
     await modelsDevCatalog.ensureLoaded();
+    for (const provider of result.providers) modelsDevCatalog.configureAccount(provider);
     return result.providers;
   };
 
@@ -246,6 +283,7 @@ export function createProviderCatalogRuntime({
     const pinnedProvider = session.providerId
       ? providers.find((item) => item.id === session.providerId)
       : undefined;
+    if (session.providerId && (!pinnedProvider || pinnedProvider.enabled === false)) return null;
     const provider =
       pinnedProvider ||
       (defaults?.defaultProviderId
@@ -282,13 +320,10 @@ export function createProviderCatalogRuntime({
       };
     }
     const { provider, modelId } = target;
-    const catalogModel = modelsDevModelFor(provider, modelId);
-    const modelConfig = modelConfigWithBinding(
-      catalogModel
-        ? modelConfigFromModelsDev(catalogModel, provider.baseUrl)
-        : genericModelConfig(modelId, provider.baseUrl ?? ""),
-      bindingForModel(provider, modelId),
-    );
+    modelsDevCatalog.configureAccount(provider);
+    const modelConfig = catalogModelConfigFor(modelsDevCatalog, {
+      providerId: provider.id, vendorKey: provider.vendorKey, baseUrl: provider.baseUrl, modelId,
+    });
     return {
       ...session,
       ...capabilitiesFromModelConfig(modelConfig),

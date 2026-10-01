@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import type { AppSettings, CloseBehavior } from "@pi-desktop/shared";
 import { useAppStore } from "../../stores/app-store";
 import { api } from "../../lib/api";
-import { Button, TooltipButton, cx } from "../../components/ui";
+import { Button, SegmentedControl, SettingsToggle } from "../../components/ui";
 import { SettingsCard, SettingsRow } from "./primitives";
 
 export function DeveloperSection({
@@ -31,22 +31,15 @@ export function DeveloperSection({
         title={t("settings.developerMode")}
         description={t("settings.developerModeDesc")}
       >
-        <button
-          type="button"
-          className={cx("settings-toggle", enabled && "on")}
-          role="switch"
-          aria-checked={enabled}
-          aria-label={t("settings.developerMode")}
-          onClick={() => void saveSettings({ developerMode: !enabled })}
-        >
-          <span className="settings-toggle-thumb" />
-        </button>
+        <SettingsToggle
+          checked={enabled}
+          label={t("settings.developerMode")}
+          onChange={() => void saveSettings({ developerMode: !enabled })}
+        />
       </SettingsRow>
       <SettingsRow
         title={t("settings.devTools")}
-        description={
-          enabled ? t("settings.devToolsDesc") : t("settings.devToolsDisabledHint")
-        }
+        description={enabled ? undefined : t("settings.devToolsDisabledHint")}
       >
         <Button variant="secondary" disabled={!enabled} onClick={() => void openConsole()}>
           {t("settings.openDevTools")}
@@ -63,7 +56,7 @@ export function DeveloperSection({
 export function CloseBehaviorSection() {
   const { t } = useTranslation();
   const [behavior, setBehavior] = useState<CloseBehavior | null>(null);
-  const [saveError, setSaveError] = useState(false);
+  const showToast = useAppStore((state) => state.showToast);
 
   useEffect(() => {
     let cancelled = false;
@@ -81,18 +74,17 @@ export function CloseBehaviorSection() {
   // The "ask" state (unset) is transient and cannot be re-selected: once a
   // choice is made it is remembered permanently. An unset preference shows
   // no active option.
-  const options: [CloseBehavior, string, string][] = [
-    ["tray", "settings.closeBehaviorTray", "settings.closeBehaviorTrayDesc"],
-    ["quit", "settings.closeBehaviorQuit", "settings.closeBehaviorQuitDesc"],
+  const options: [CloseBehavior, string][] = [
+    ["tray", "settings.closeBehaviorTray"],
+    ["quit", "settings.closeBehaviorQuit"],
   ];
 
   const choose = async (next: CloseBehavior) => {
-    setSaveError(false);
     try {
       await api.setCloseBehavior(next);
       setBehavior(next);
     } catch {
-      setSaveError(true);
+      showToast(t("settings.closeBehaviorSaveError"), { variant: "error" });
     }
   };
 
@@ -102,35 +94,13 @@ export function CloseBehaviorSection() {
         title={t("settings.closeBehaviorTitle")}
         description={t("settings.closeBehaviorDesc")}
       >
-        <div
-          className="settings-segment"
-          role="radiogroup"
-          aria-label={t("settings.closeBehaviorTitle")}
-        >
-          {options.map(([value, labelKey, descKey]) => (
-            <TooltipButton
-              key={value}
-              type="button"
-              role="radio"
-              aria-checked={behavior === value}
-              tooltip={t(descKey)}
-              ariaLabel={t(labelKey)}
-              className={cx(
-                "settings-segment-item",
-                behavior === value && "active",
-              )}
-              onClick={() => void choose(value)}
-            >
-              {t(labelKey)}
-            </TooltipButton>
-          ))}
-        </div>
+        <SegmentedControl<CloseBehavior>
+          value={behavior ?? ("" as CloseBehavior)}
+          onChange={(value) => void choose(value)}
+          options={options.map(([value, labelKey]) => ({ value, label: t(labelKey) }))}
+          label={t("settings.closeBehaviorTitle")}
+        />
       </SettingsRow>
-      {saveError ? (
-        <span className="settings-command-shell-state error" role="status">
-          {t("settings.closeBehaviorSaveError")}
-        </span>
-      ) : null}
     </SettingsCard>
   );
 }

@@ -1,4 +1,4 @@
-import { memo, useContext, useMemo } from "react";
+import { memo, useMemo, type MouseEvent as ReactMouseEvent } from "react";
 import { useTranslation } from "react-i18next";
 import type { PlanningState, UiMessage } from "@pi-desktop/shared";
 import { proposalKindForMode } from "@pi-desktop/shared";
@@ -13,37 +13,27 @@ import { TRANSCRIPT_SKELETON_ROWS } from "../../../lib/transcript-settle";
 import {
   PlanningIndicator,
   RunActivityIndicator,
-  StreamingTokenRateIndicator,
   WorkingIndicator,
 } from "./ActivityGroup";
 import { useLiveTokenRate } from "./hooks/useLiveTokenRate";
 import { assistantTurnMessages } from "../../../lib/assistant-turns";
 import { TranscriptHistory, TranscriptTail } from "./AssistantTurn";
-import { TranscriptReadOnlyContext, useActiveSessionTitle } from "./context";
-import { SelectionQuoteButton } from "../../../components/SelectionQuoteButton";
-import { ResponseAnnotationOverlay } from "../../../components/ResponseAnnotationOverlay";
 import { useTranscriptScroll } from "./hooks/useTranscriptScroll";
 import type { TranscriptSearchTarget } from "../../../lib/transcript-reading";
 import { TranscriptSearchContext } from "../../../lib/transcript-search-context";
+import { DisclosureAnchorContext } from "../../../lib/disclosure-anchor-context";
+import { api } from "../../../lib/api";
+import { mergeLiveSessionMessages } from "../../../lib/session-transcript";
+import { conversationPlainText } from "../../../lib/chat-transcript-text";
+import {
+  TranscriptMenuProvider,
+  useChatTextActions,
+  useTranscriptMenu,
+} from "./TranscriptMenu";
+import { conversationMenuItems } from "./menu-items";
+import { SlotSessionProvider } from "../../../plugins/renderer-slots/use-slots";
 
-export const ChatTranscript = memo(function ChatTranscript({
-  sessionId,
-  messages,
-  hasMoreBefore = false,
-  onLoadOlder,
-  isRunning,
-  pendingPermission,
-  queuedPermissions = 0,
-  askPending = false,
-  planningState,
-  paneVisible = true,
-  searchTarget = null,
-  readingWindow = false,
-  hasMoreAfter = false,
-  onLoadNewer,
-  onReturnToLatest,
-  navigationLoading = false,
-}: {
+type ChatTranscriptProps = {
   sessionId: string | undefined;
   messages: UiMessage[];
   hasMoreBefore?: boolean;
@@ -66,11 +56,46 @@ export const ChatTranscript = memo(function ChatTranscript({
   onLoadNewer?: () => Promise<void>;
   onReturnToLatest?: () => void;
   navigationLoading?: boolean;
-}) {
+};
+
+/**
+ * The transcript facade only mounts the right-click menu provider: the
+ * scroller's own background menu has to consume that context, and a component
+ * cannot read a provider it renders itself.
+ */
+export const ChatTranscript = memo(function ChatTranscript(
+  props: ChatTranscriptProps,
+) {
+  return (
+    <TranscriptMenuProvider>
+      <TranscriptBody {...props} />
+    </TranscriptMenuProvider>
+  );
+});
+
+function TranscriptBody({
+  sessionId,
+  messages,
+  hasMoreBefore = false,
+  onLoadOlder,
+  isRunning,
+  pendingPermission,
+  queuedPermissions = 0,
+  askPending = false,
+  planningState,
+  paneVisible = true,
+  searchTarget = null,
+  readingWindow = false,
+  hasMoreAfter = false,
+  onLoadNewer,
+  onReturnToLatest,
+  navigationLoading = false,
+}: ChatTranscriptProps) {
   const { t } = useTranslation();
+  const openTranscriptMenu = useTranscriptMenu();
+  const { copyText, selectText } = useChatTextActions();
+  const showToast = useAppStore((state) => state.showToast);
   const transcriptRunning = isRunning && !readingWindow;
-  const transcriptReadOnly = useContext(TranscriptReadOnlyContext);
-  const sessionTitle = useActiveSessionTitle();
   const latestTurnResult = useAppStore((state) =>
     sessionId ? state.latestTurnResults[sessionId] : undefined,
   );
@@ -111,7 +136,7 @@ export const ChatTranscript = memo(function ChatTranscript({
     handleScroll,
     revealEarlierHistory,
     jumpToLatest,
-    navigateAnnotation,
+    disclosureAnchorNotifier,
   } = useTranscriptScroll({
     sessionId,
     messages,
@@ -128,63 +153,37 @@ export const ChatTranscript = memo(function ChatTranscript({
     readingWindow,
   });
 
-  const lastEntry = tailEntry;
-  const lastTurnPart =
-    lastEntry?.kind === "assistant-turn" ? lastEntry.parts.at(-1) : undefined;
-  const activeToolGroup = transcriptRunning && lastTurnPart?.kind === "activity";
-  const assistantIsAnswering =
-    lastTurnPart?.kind === "message" &&
-    lastTurnPart.message.status === "streaming" &&
-    Boolean((lastTurnPart.message.content || "").trim());
   const specializedActivity = agentActivity;
   const hasSpecializedActivity = specializedActivity !== undefined;
-  const showRunActivity =
-    transcriptRunning &&
-    !pendingPermission &&
-    !askPending &&
-    !approvalPending &&
-    !assistantIsAnswering &&
-    hasSpecializedActivity;
-  // Show immediate feedback after send, then let the concrete activity row
-  // (thinking/tool/answer) take over so the transcript never duplicates state.
-  const showWorking =
-    transcriptRunning &&
-    !pendingPermission &&
-    !askPending &&
-    !approvalPending &&
-    planningState !== "planning" &&
-    !activeToolGroup &&
-    !assistantIsAnswering &&
-    !hasSpecializedActivity;
-  // Same pre-stream slot as Working: once tools or an answer exist, activity
-  // rows carry the live state so a Planning label does not sit orphaned above
-  // the composer. The Composer mode chip keeps pulsing for the turn.
-  const showPlanning =
-    transcriptRunning &&
-    planningState === "planning" &&
-    !approvalPending &&
-    !pendingPermission &&
-    !askPending &&
-    !activeToolGroup &&
-    !assistantIsAnswering &&
-    !hasSpecializedActivity;
-
-  const streamingAssistant = useMemo(() => {
-    if (!transcriptRunning || lastEntry?.kind !== "assistant-turn") {
-      return undefined;
-    }
-    return [...assistantTurnMessages(lastEntry)]
-      .reverse()
-      .find((message) => message.status === "streaming");
-  }, [transcriptRunning, lastEntry]);
-
-  const liveTokenRateActive =
+  // Existing output does not mean the turn has finished: a text stream can
+  // pause, and completed tool rows can outlive their activity. Keep one tail
+  // status until the turn ends or a user interaction owns the pending state.
+  const showStatus =
     transcriptRunning &&
     !pendingPermission &&
     !askPending &&
     !approvalPending;
+  const showRunActivity = showStatus && hasSpecializedActivity;
+  const showWorking =
+    showStatus &&
+    planningState !== "planning" &&
+    !hasSpecializedActivity;
+  const showPlanning =
+    showStatus &&
+    planningState === "planning" &&
+    !hasSpecializedActivity;
+
+  const streamingAssistant = useMemo(() => {
+    if (!transcriptRunning || tailEntry?.kind !== "assistant-turn") {
+      return undefined;
+    }
+    return [...assistantTurnMessages(tailEntry)]
+      .reverse()
+      .find((message) => message.status === "streaming");
+  }, [transcriptRunning, tailEntry]);
+
   const liveTokenRate = useLiveTokenRate({
-    active: liveTokenRateActive,
+    active: showStatus,
     content: streamingAssistant?.content,
     thinking: streamingAssistant?.thinking,
     outputTokens:
@@ -192,8 +191,58 @@ export const ChatTranscript = memo(function ChatTranscript({
       streamingAssistant?.responseOutputTokens,
   });
 
+  // The tail status lane is part of the layout for the whole running turn: the
+  // indicators below mount and clear with the turn's phase, and a lane that
+  // came and went with them would resize `.thread-content` and push the rows
+  // the user is already reading (issue #323). An idle transcript renders no
+  // lane at all, so a finished transcript keeps its exact layout.
+  const runtimeStatusLane = transcriptRunning;
+
+  /*
+    The background menu answers the right-clicks no row claimed: the space below
+    the last turn, a system row, a permission or outcome card. It reads the
+    conversation rather than one message, so it is the only surface that can
+    copy the whole thread.
+  */
+  const copyConversation = async () => {
+    if (!sessionId) return;
+    try {
+      // Explicit copy reads the full session without changing the reading window.
+      const { session } = await api.getSession(sessionId);
+      if (!session) throw new Error("Session unavailable");
+      await copyText(conversationPlainText(
+        mergeLiveSessionMessages(session.messages ?? [], messages),
+        { user: t("chat.speakerYou"), assistant: t("chat.speakerAssistant") },
+      ));
+    } catch {
+      showToast(t("chat.copyFailed"), { variant: "error" });
+    }
+  };
+
+  const onContextMenu = (event: ReactMouseEvent<HTMLDivElement>) => {
+    openTranscriptMenu(event, {
+      label: t("chat.conversationMenu"),
+      items: conversationMenuItems({
+        t,
+        canCopy: Boolean(sessionId) && (hasMoreBefore || hasMoreAfter || messages.some(
+          (message) => (message.role === "user" || message.role === "assistant") && message.content.trim(),
+        )),
+        onCopyConversation: () => void copyConversation(),
+        scrollRef,
+        contentRef,
+        actions: { copyText, selectText },
+        onReturnToLatest: () => {
+          onReturnToLatest?.();
+          jumpToLatest();
+        },
+      }),
+    });
+  };
+
   return (
     <TranscriptSearchContext.Provider value={searchTarget}>
+    <DisclosureAnchorContext.Provider value={disclosureAnchorNotifier}>
+    <SlotSessionProvider sessionId={sessionId ?? ""}>
     <div
       className="thread-wrap"
       ref={wrapRef}
@@ -214,17 +263,11 @@ export const ChatTranscript = memo(function ChatTranscript({
           onRevealEarlier={revealEarlierHistory}
         />
       ) : null}
-      {/* Quoting follows the selection: the row action at the end of a long
-        * answer is the wrong end of the message to reach for (ADR message-quotes-and-side-chats / D-LOCAL-selection-overlay). */}
-      {transcriptReadOnly || !paneVisible ? null : (
-        <SelectionQuoteButton scrollRef={scrollRef} title={sessionTitle} />
-      )}
-      {!transcriptReadOnly && paneVisible && !veilCovering && sessionId ? (
-        <ResponseAnnotationOverlay sessionId={sessionId} scrollRef={scrollRef} onNavigate={navigateAnnotation} />
-      ) : null}
       <div
         className="thread-scroll"
         ref={scrollRef}
+        data-scroll-owner="transcript"
+        onContextMenu={onContextMenu}
         onScroll={handleScroll}
         role="log"
         aria-live="polite"
@@ -271,25 +314,26 @@ export const ChatTranscript = memo(function ChatTranscript({
               result={latestTurnResult}
             />
           ) : null}
-          {pendingPermission && !transcriptReadOnly ? (
+          {pendingPermission ? (
             <PermissionCard
               key={pendingPermission.requestId}
               permission={pendingPermission}
               queued={queuedPermissions}
             />
           ) : null}
-          {showRunActivity && specializedActivity ? (
-            <RunActivityIndicator
-              activity={specializedActivity}
-              tokenRate={liveTokenRate}
-            />
-          ) : null}
-          {showPlanning ? <PlanningIndicator kind={planningKind} /> : null}
-          {showWorking ? (
-            <WorkingIndicator tokenRate={liveTokenRate} />
-          ) : null}
-          {assistantIsAnswering ? (
-            <StreamingTokenRateIndicator tokenRate={liveTokenRate} />
+          {runtimeStatusLane ? (
+            <div className="transcript-runtime-status">
+              {showRunActivity && specializedActivity ? (
+                <RunActivityIndicator
+                  activity={specializedActivity}
+                  tokenRate={liveTokenRate}
+                />
+              ) : null}
+              {showPlanning ? <PlanningIndicator kind={planningKind} /> : null}
+              {showWorking ? (
+                <WorkingIndicator tokenRate={liveTokenRate} />
+              ) : null}
+            </div>
           ) : null}
         </div>
       </div>
@@ -340,6 +384,8 @@ export const ChatTranscript = memo(function ChatTranscript({
         </TooltipButton>
       ) : null}
     </div>
+    </SlotSessionProvider>
+    </DisclosureAnchorContext.Provider>
     </TranscriptSearchContext.Provider>
   );
-});
+}

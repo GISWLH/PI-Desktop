@@ -12,7 +12,12 @@ import {
   type CatalogApiStyle,
 } from "./model-catalog.js";
 import { matchNamedPreset, normalizeEndpointUrl } from "./provider-presets.js";
-import type { ModelBinding, ProviderCreateInput, ThinkingLevel } from "./types.js";
+import type {
+  ModelLimitSource,
+  ModelBinding,
+  ProviderCreateInput,
+  ThinkingLevel,
+} from "./types.js";
 
 export const MODEL_CONFIG_IMPORT_SOURCES = [
   "claude-code",
@@ -425,9 +430,14 @@ export function parsePiModelConfig(
     const baseUrl = firstString(record.baseUrl, record.baseURL, record.url);
     const apiStyle = resolveApiStyle(firstString(record.api, record.apiStyle, record.type));
     const headers = asRecord(record.headers);
+    // pi resolves `"!<cmd>"` values by running the command at request time. The
+    // importer never executes it and never stores the command text as a key, so
+    // the provider is imported without a secret (`hasSecret: false`).
     const secret = firstSecret(
-      resolveSecret(record.apiKey ?? record.api_key, env),
-      secretFromAuthHeader(headers),
+      isShellCommandSecret(record.apiKey ?? record.api_key)
+        ? undefined
+        : resolveSecret(record.apiKey ?? record.api_key, env),
+      isShellCommandSecret(authHeaderValue(headers)) ? undefined : secretFromAuthHeader(headers),
     );
     const modelEntries = Array.isArray(record.models) ? record.models : [];
     const modelIds = uniqueModelIds(modelEntries.map(modelIdFromUnknown));
@@ -533,10 +543,13 @@ function parseCcSwitchProvider(
     );
   }
   if (appType === "pi") {
-    return retagCcSwitch(
-      row,
-      parsePiModelConfig({ providers: { [row.id]: row.settingsConfig } }, env),
-    );
+    // Pi providers have an authoritative native config (`~/.pi/agent/models.json`).
+    // CC Switch only stores a one-shot v18 migration snapshot of that file; models
+    // added afterwards never make it back in, and our dedupe key ignores `models`
+    // coverage. Trusting the snapshot silently drops the newer entries and lands
+    // pi providers under the "CC Switch" group with a renamed label. Let the `pi`
+    // scanner own these rows so the source of truth wins. See issue #588.
+    return [];
   }
   if (appType === "codex" || appType === "grokbuild") {
     return parseCcSwitchTomlApp(row, env, appType === "codex" ? "responses" : "chat_completions");
@@ -814,8 +827,27 @@ function bindingFromGenericModel(
   return {
     ...base,
     contextWindow: contextWindow ?? base.contextWindow,
+    // A window the file states is an explicit answer from its author; the
+    // generic seed it falls back to keeps following the catalog.
+    contextWindowSource:
+      importedModelLimitSource(record?.contextWindowSource) ??
+      (contextWindow === undefined ? base.contextWindowSource : "user"),
     maxTokens: maxTokens ?? base.maxTokens,
+    maxTokensSource:
+      importedModelLimitSource(record?.maxTokensSource) ??
+      (maxTokens === undefined ? base.maxTokensSource : "user"),
+    ...(record?.nativeWebSearch === true || record?.native_web_search === true
+      ? { nativeWebSearch: true }
+      : {}),
   };
+}
+
+/**
+ * A config exported by PI-Desktop carries the provenance marker; an older or
+ * foreign config does not.
+ */
+function importedModelLimitSource(value: unknown): ModelLimitSource | undefined {
+  return value === "catalog" || value === "user" ? value : undefined;
 }
 
 function bindingFromPiModel(value: unknown): ModelBinding | null {
@@ -873,14 +905,22 @@ function authApiKey(value: unknown): string | undefined {
   return firstString(record.key, record.apiKey, record.token);
 }
 
-function secretFromAuthHeader(headers: unknown): string | undefined {
+function isShellCommandSecret(raw: unknown): boolean {
+  return typeof raw === "string" && raw.trim().startsWith("!");
+}
+
+function authHeaderValue(headers: unknown): string | undefined {
   const record = asRecord(headers);
-  const value = firstString(
+  return firstString(
     record?.Authorization,
     record?.authorization,
     record?.["x-api-key"],
     record?.["X-Api-Key"],
   );
+}
+
+function secretFromAuthHeader(headers: unknown): string | undefined {
+  const value = authHeaderValue(headers);
   if (!value) return undefined;
   const bearer = value.match(/^Bearer\s+(.+)$/i);
   return sanitizeSecret(bearer ? bearer[1] : value);

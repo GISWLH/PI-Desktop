@@ -300,12 +300,15 @@ Namespace: `pi.plugin.*`
 - `pi.session.list()` / `get()` / `listMessages()` // `session.read.own`
 - `pi.session.rename()` // `session.update.own`
 - `pi.session.delete()` // `session.delete.own`
+- `pi.usage.listTurns()` // `usage.read`; read-only completed-turn facts, no message bodies
 - `pi.agent.complete(input)` // `agent.complete`; host-owned one-shot
 
 Skills are contributed declaratively (`contributes.skills` + `agent.prompt.inject`),
 not invoked by the plugin: the host puts the catalog in the system prompt and the
 model loads a body through the built-in `Skill` tool (D174). Planned, not
-currently exposed: `pi.agent.appendSystemHint(text)`.
+currently exposed: `pi.agent.appendSystemHint(text)`. When the body is loaded,
+the tool result also identifies the `SKILL.md` location and the directory to use
+when resolving relative references; the catalog remains metadata-only.
 
 ### Background services (requires `background.service`)
 - `pi.services.register({ id, start, stop? })`
@@ -517,12 +520,33 @@ Rules the control encodes:
   on each call. Removed tools return `TOOL_NOT_FOUND`. Recovery never replays a
   failed `tools/call`, which may already have performed a mutation.
 
+- Streamable HTTP `202 Accepted` acknowledgements for notifications and client
+  responses are not JSON-RPC replies. Any acknowledgement body is discarded,
+  including plain-text `Accepted`; ordinary request replies still follow the
+  JSON/SSE parsing and response-size limits.
+- A streamable-HTTP server may write its JSON-RPC reply and keep the SSE stream
+  open afterwards — keep-alives, or a session it ends on its own schedule. Each
+  `text/event-stream` event is dispatched as it arrives, so a handshake or a
+  `tools/list` page completes on its reply instead of on the end of the stream.
+  The request budget still bounds the exchange: a server that never replies
+  still times out, and a stream left open past its request is aborted.
+- The MCP row shows “Authorization required” only when runtime status explicitly
+  reports `authRequired`. Missing credentials, an untested connection, and
+  non-authentication failures do not imply OAuth is required. A stored OAuth
+  credential does not hide a subsequent authentication failure. Manual OAuth
+  authorization remains available from the HTTP server menu.
+
 ### 12.3 Skills management in Settings > Agent
 
 - The Skills page has independent global and selected-project columns rooted at
   `~/.agents/skills` and `<project>/.agents/skills`.
-- Each column has one native single-file Import action; the host physically
-  copies the selected file and scans its frontmatter.
+- Each column has a native single-file Import action and a folder Import action
+  that can select multiple `<name>/SKILL.md` folders at once. The host imports
+  selected folders independently, preserves sibling resources, and reports
+  partial failures without undoing successful imports. The folder picker
+  reopens at the parent of the last successfully imported source folder when
+  that parent still exists; cancellation and all-failed batches leave that
+  machine-local value unchanged.
 - A `SKILL.md` import or scan uses the parent directory as the id when the
   frontmatter name is not an ASCII slug, and folded YAML descriptions still
   enter the catalog. A readable document is never dropped because its title is

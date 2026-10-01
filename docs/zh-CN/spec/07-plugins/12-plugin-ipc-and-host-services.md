@@ -182,7 +182,7 @@ plugin runtime
 **实施（2026-07-29，ADR 0008）：** 经纪人居住在
 `electron/main/plugin-runtime.ts` 和每个插件调用都是对
 插件自己的 `utilityProcess`。预算：加载 15 秒，生命周期挂钩 5 秒，命令 30 秒，
-工具 110 秒（根据 host-core 的 120 秒工具预算）。进程退出经纪人
+工具 110 秒（根据 host-core 的 150 秒调度预算）。进程退出经纪人
 使用 `PLUGIN_CRASHED` 拒绝挂起的调用，取消注册该插件的命令
 和工具，关闭其面板，写入 `plugin.crash` 审核条目，并发出
 toast 加上 `pluginChanged` 到渲染器。
@@ -202,7 +202,7 @@ toast 加上 `pluginChanged` 到渲染器。
 1.模型调用`plugin_<pluginIdSafe>_<toolName>`； sidecar 转发它
    像任何内置工具一样托管 `tools.execute`。
 2. host-core 首先解析持久操作模式。在 Agent 中，它运行
-   正常权限流程（风险、会话授予、120 秒超时），然后发出
+   正常权限流程（风险、会话授予、无自动截止时间），然后发出
    通知 `plugins.execute`
    `{ executionId, sessionId, toolCallId, toolName, args, turnId }`。`turnId` 是
    运行时回合身份，原样转发，以便插件工具上下文能与
@@ -212,8 +212,12 @@ toast 加上 `pluginChanged` 到渲染器。
    Electron主要执行注册的插件工具JS并通过RPC应答
    `plugins.resolveExecution` `{ executionId, ok, content, errorCode? }`。
 4. host-core 解析待执行并返回一个标准
-   `ToolsExecuteResult` 到 sidecar。调度超时映射到
-   `TOOL_TIMEOUT`； unknown/unloaded 工具映射到 `TOOL_NOT_FOUND`。
+   `ToolsExecuteResult` 到 sidecar。调度最多等待 150 秒
+   （`DESKTOP_TOOL_DISPATCH_TIMEOUT_MS`，高于 110 秒的插件工具预算，也高于最宽的
+   MCP 支路：10 秒惰性握手 + 30 秒 `tools/list` 遍历 + 100 秒调用），超时映射到
+   `TOOL_TIMEOUT`；unknown/unloaded 工具映射到 `TOOL_NOT_FOUND`。这类调用的传输截止
+   等待明确权限决定时，`tools.execute` 传输没有截止时间；批准后仍以 host-core 的工具
+   执行预算为准。
 
 面向模型的注册表根据提示获得插件工具：已注册主要通道
 defs（`fullName`、描述、JSON 架构参数）到 `agent.prompt`，以及

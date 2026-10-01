@@ -107,7 +107,7 @@ No host RPC or storage schema change is required.
 1. load the durable session and reject a missing session
 2. resolve that session's mode/provider/model and project binding (app/current
    workspace defaults are legacy fallback only)
-3. resolve the complete models.dev metadata record for the exact provider/API
+3. resolve the complete Pi catalog metadata record for the exact provider/API
    URL and model and clamp the durable session thinking level to its nearest
    supported value; an ID absent from the snapshot uses the explicit generic
    fallback
@@ -155,7 +155,7 @@ host-confirmed transition.
 ### 5d. Bounded provider recovery and diagnostics (D186, D245, D259, D378, ADR 0091, ADR 0128, ADR 0206)
 
 Provider request setup and stream delivery are separate failure phases, but
-HTTP 429 handling is one logical-turn policy. pi-ai's nested adapter retry is
+HTTP 429 handling is one response-recovery policy. pi-ai's nested adapter retry is
 disabled for this path so the runtime can share one budget across both phases.
 
 `PROVIDER_RATE_LIMITED` receives at most ten retries after the initial
@@ -184,7 +184,7 @@ server or calculated value is capped at 30 seconds. The runtime captures the
 failed response status and headers from fetch because pi-ai's ordinary response
 callback only covers an established response.
 
-Non-429 transient failures share their own bounded logical-turn budget of ten
+Non-429 transient failures share their own bounded response-recovery budget of ten
 retries after the initial attempt, for eleven provider attempts total. The budget
 is shared by request setup and stream delivery, so a fault that moves between
 phases cannot reset or multiply it, and it is separate from the 429 budget. It
@@ -194,6 +194,15 @@ headers or mid-stream. Authentication, model-selection, malformed-request,
 context, and other non-retryable errors do not enter either provider replay
 path, and a non-retryable `PROVIDER_ERROR` from a malformed 400/422 request
 stays terminal.
+
+Both budgets reset after a complete, non-error, non-aborted model response,
+including a response that requests tools. The next model request starts with
+fresh counters and backoff, even within the same user turn. Receiving HTTP
+headers, partial text, or changing failure phase does not reset either budget.
+This rule applies to the main session and builtin subagents: a long task with
+independent recovered outages must not eventually stop because earlier tool
+rounds consumed the budget. One-shot completions still use one bounded budget
+for their single response. Persistent failures remain bounded and abortable.
 
 Before surfacing a pre-stream `PROVIDER_ERROR` for HTTP 400/422 whose message
 ends in `(no body)`, the runtime makes at most one silent repair attempt with
@@ -218,6 +227,18 @@ Only the failed request is replayed. The session, its transcript, and its tool
 state are untouched: the failed assistant is removed from the next model context
 and the same visible message id is reused, so a retry never restarts the turn or
 re-runs a completed tool call.
+
+The application setting `infiniteProviderRetry` is off by default. When enabled,
+the main session and its builtin subagents skip only the ten-retry ceiling for
+`NETWORK_ERROR`, `TIMEOUT`, `STREAM_FAILED`, retryable `PROVIDER_ERROR`
+(including 5xx gateway failures), and `PROVIDER_RATE_LIMITED`. The same backoff,
+`Retry-After` precedence, visible retry status, and abort/Stop path remain in
+force. Non-retryable errors, context recovery, compaction, tool execution, and
+one-shot completions are unchanged. The setting can keep billing requests alive
+indefinitely until the user stops the turn.
+Settings reads expose an explicit boolean for this flag: absent or disabled
+values normalize to `false`. Read-modify-write operations on unrelated settings
+must remain valid without enabling retries; non-boolean writes stay invalid.
 Each retry is abortable and reports its current backoff through the normalized
 status event. The `retrying` activity carries the classified error code, the
 bounded/redacted provider message, and the HTTP status when known. The main
@@ -227,15 +248,29 @@ codes, budget size, and precedence.
 When the retry budget is exhausted, the final assistant error and lifecycle
 `error` are emitted once. Provider failures carry bounded diagnostics in
 `AppError.details` when available: `phase` (`request` or `stream`),
-`providerStatus`, `providerCode`, `providerWaitMs`, `streamMs`, and
-`retryAttempt`. For a persistent 429 or non-429 transient failure,
-`retryAttempt` is `10`. Credentials and unrestricted response bodies never
+`providerStatus`, `providerCode`, `providerWaitMs`, `streamMs`,
+`retryAttempt`, the network diagnosis (`networkCategory`, `networkCode`,
+`networkSyscall`, `networkHost`, `networkRoute`) and the request correlation
+(`requestMessages`, `requestBytes`, `compactionGeneration`). For a persistent
+429 or non-429 transient failure,
+`retryAttempt` is `10`, derived from the exhausted error class's budget rather
+than temporary retry activity state. Credentials and unrestricted response bodies never
 enter the event or log. The active-turn status shows the remaining backoff and
 the retry budget as `Retrying in 0s · attempt 9/10` in English.
 
+Each retry builds a new request, stream, and `AbortController`; the one piece of
+state a retry shares is the process-wide undici dispatcher. When the same origin
+fails twice in a row without any response and no fresh attempt reaches it, the
+transport is rebuilt once (throttled to one rebuild every 30 seconds, never for
+`dns`) before the next attempt, so the retry does not replay into a pool whose
+connection is already dead. The rebuild installs the replacement before closing
+the previous dispatcher and closes it gracefully, and it reproduces the
+configured route, so another session's in-flight request finishes on the pool it
+started on and a proxy is never silently dropped.
+
 ### 5e. Silent-turn recovery
 
-A turn that ends with no tool call and no visible assistant text is invisible
+An ordinary turn that ends with no tool call and no visible assistant text is invisible
 to the user: reasoning is never rendered, so a conclusion written only there
 did not arrive. 15 of 255 recorded sessions ended a turn that way, and the
 user's only recourse was typing "继续".
@@ -276,7 +311,35 @@ If the re-run is silent too, the turn ends as a visible assistant error with
 retriable `EMPTY_MODEL_RESPONSE`, which gives the transcript its normal retry
 action. No empty assistant message is persisted in either case.
 
-Decision D193; see E2E-146.
+A Host-ledger completion notice (ADR 0239, D446) is the narrow exception:
+its prompt already permits no acknowledgement. Main resolves the queued message
+by ID, verifies its target session, and constructs provenance from the ledger.
+The runtime accepts silence only for `kind: completion` targeting the current
+session with nonempty message and reply-to IDs. A silent notice reply emits its
+normal completed message and terminal lifecycle without a recovery request or
+`EMPTY_MODEL_RESPONSE`. Provider errors and aborts retain their normal handling,
+and a provider retry of the same attempt keeps the exception. The original
+task/result is not rewritten, and completion notices never request another
+callback.
+
+The exception covers exactly the notice's own reply: the first settled
+assistant response of the run spends it, whether that response is silent,
+textual, or a tool batch. A reply that follows tool results is therefore
+ordinary work under this section, and the exception is revoked as soon as an
+accepted steering message enters the model context, so a reply to the user
+keeps its full re-run and error path. Every new run recomputes it from the
+prompt's provenance. Ordinary user input, task/message deliveries, copied
+source framing, and restored history cannot enable it.
+
+An accepted silent reply is still not worth resending. Main persists it as an
+empty completed row (the transcript hides it and the host stores no text), but
+the runtime keeps it out of its entries and out of pi's transcript state, and
+the context projection drops any assistant with no content blocks, exactly as
+a restored transcript already did. The next provider request therefore carries
+no empty assistant message.
+
+Decision D193 and D446 (ADR 0239 amendment); see E2E-146 and
+E2E-SESSION-completion-notice-allows-silence.
 
 ### 5e.1. Progress-only recovery for approved Plan/Goal execution
 
@@ -320,15 +383,16 @@ entries. The desktop runtime owns when they run and how the result crosses the
 Rust storage boundary; OpenCode DCP is an AGPL-3.0 behavioral reference only,
 not a linked or copied dependency.
 
-Compaction follows Codex's mechanism (ADR 0064): it always happens inline at a
-turn boundary, the model can request it through `new_context`, every compaction
-adds a transcript row and raises one warning toast, and there is no
-pre-computation anywhere.
+Compaction follows Codex's mechanism (ADR 0064, amended by D623): it remains
+inline at turn boundaries, and the model can request it through `new_context`.
+Automatic compaction starts at 90% of the derived `hardLimit`; there is no
+background pre-computation.
 
 pi 0.84.4+ invokes `prepareNextTurn` only when the loop will start another
 assistant turn in the same run — including between a completed tool batch and
-the follow-up model request. A new user prompt still compacts before its first
-provider request through `automaticCompactionNeeded` in `prompt()`.
+the follow-up model request. A new user prompt is checked before its first
+provider request through `automaticCompactionNeeded` in `prompt()`, including
+the pending user message.
 
 For every pi loop turn:
 
@@ -336,21 +400,22 @@ For every pi loop turn:
    results for that turn are complete
 2. PI-Desktop rebuilds the context from the full transcript plus the newest
    valid checkpoint and estimates the next request budget
-3. below the hard boundary, and with no pending model request, the next turn
-   proceeds unchanged
-4. at or above the hard boundary, or when the model called `new_context`,
+3. below 90% of `hardLimit`, and with no pending model request, the next turn
+   proceeds unchanged (a budget reminder may be added to that request)
+4. at or above the 90% trigger, or when the model called `new_context`,
    compaction runs synchronously before the next provider request. In the
    summary family, generation is mandatory; the runtime preflights the summary
-   input against the model window and skips a request that cannot fit. An
-   automatic summary failure first attempts a deterministic retained-tail
-   checkpoint, while manual compaction still reports
-   `CONTEXT_COMPACTION_FAILED`
+   input against the model window, reduces it once, and then splits a range that
+   still does not fit into chunks that each do, so a prompt too large for one
+   request is summarized by several (ADR 0302). An automatic summary failure
+   first attempts a deterministic retained-tail checkpoint. If a soft-trigger
+   compaction fails but the request remains below `hardLimit`, the unchanged
+   context may proceed; once the hard boundary is reached, failure is terminal.
 5. successful generation or deterministic recovery first appends the
    checkpoint through host-core, then installs its summary plus the applicable
-   retained tail as the runtime context for the next provider request; a
-   hard-boundary checkpoint is re-estimated before it is persisted and again
-   before continuation, and cannot authorize the next request unless it is
-   below the hard budget
+   retained tail as the runtime context for the next provider request; every
+   checkpoint is re-estimated before persistence and continuation, and cannot
+   authorize a request at or above the hard budget
 
 Checkpoint generation and installation are separate operations.
 `buildCheckpoint` runs the preparation, budget preflight, and summary request
@@ -358,15 +423,29 @@ without persisting anything or changing the active checkpoint; installation
 re-estimates, appends through host-core, updates the active checkpoint, and
 emits `compaction_end`. The blocking path composes the two back to back.
 
-**What survives a checkpoint.** The model context after a compaction is the
-summary plus, at most, one **user** message; assistant and tool messages are
-dropped from model context and remain in the visible transcript. pi's
+**What survives a checkpoint.** A successful checkpoint leaves the model context
+as the summary plus, at most, one **user** message; assistant and tool messages
+are dropped from model context and remain in the visible transcript. pi's
 `prepareCompaction` still chooses the cut point, so its turn-boundary and
 split-turn handling are preserved, but the runtime then folds the split-turn
 prefix and the recent tail back into the summary input, so the summary covers
 the whole compacted range and nothing crosses the boundary uncovered.
 
-The retention mode is selected from the lifecycle that requested compaction:
+A **retained-tail fallback** is the exception, because no summary covers its
+range: it keeps the real recent window — the newest contiguous messages of the
+compacted range, every role, bounded by the keep-recent target and by what the
+safe budget leaves once the carried-forward summary and the recovery notice are
+paid for — and records `details.retainedTailShape` as `recent_window`, so a
+rebuild replays that window instead of narrowing it back to one user message
+(ADR 0302, issue #827). It drops the assistant messages pi drops from the
+rebuilt context anyway (error, aborted, deferred) and any tool result whose tool
+call is not in the window, because a provider rejects a result whose call is
+missing. An `active_turn` fallback also keeps the active task's user message
+ahead of the window when the window itself cannot hold it, so the continuation
+never loses its goal.
+
+The retention mode is selected from the lifecycle that requested compaction. It
+decides what a *successful* checkpoint leaves behind:
 
 - An `active_turn` checkpoint is created while the provider must continue the
   current task after a tool result, a `toolUse` turn, or overflow recovery. It
@@ -378,16 +457,25 @@ The retention mode is selected from the lifecycle that requested compaction:
   a new user prompt, or for manual compaction. It carries no naked historical
   user messages. The summary is authoritative for completed work, and the next
   user prompt is the only new task after the checkpoint.
+- A retained-tail fallback carries its recent window in both modes, because the
+  alternative is an empty context; the mode still decides whether it has to
+  keep the active task's user message as well.
 - The `fresh_window` family remains the deliberate no-summary exception from
   ADR 0064 and always carries an empty tail.
 
-The retained-tail mode is stored in the checkpoint's opaque `details` field so
-restart preserves the same task boundary. Checkpoints written before this
-field existed are normalized to their latest user message only. Dropping an
-assistant message also drops its tool calls, so no orphaned tool call can reach
-the provider. The retained tail is re-estimated with the summary before
-persistence and before continuation, so an oversized request still cannot pass
-the guard.
+The retained-tail mode and shape are stored in the checkpoint's opaque `details`
+field, so a restart preserves the same task boundary and the same treatment of
+the tail. A checkpoint without the shape marker — every successful checkpoint,
+and every record written before the marker existed — is normalized to its latest
+user message only, so a restart cannot restore a sequence of
+executable-looking old requests. Dropping an assistant message also drops its
+tool calls, and the fallback drops the results of calls it did not keep, so no
+orphaned tool call or unmatched result can reach the provider. The retained tail
+is re-estimated with the summary before persistence and before continuation, so
+an oversized request still cannot pass the guard. A fallback also records
+`details.failureReason` — `no_new_history`, `summary_budget`,
+`summary_provider`, or `checkpoint_oversized` — a closed vocabulary rather than
+provider error text, which can carry endpoint details.
 
 **Two compaction families.** Both run the same lifecycle — budget
 re-estimation, host-core append, `compaction_end`, transcript row, warning:
@@ -411,29 +499,83 @@ installed: one when the remaining budget falls to
 one at 2,000 tokens remaining, telling it to write down whatever must survive.
 Neither reminder is persisted or shown in the transcript.
 
-The hard boundary is the model context window minus request headroom.
-Headroom is the maximum of a 16,384-token reserve floor, model maximum output
-capped at 25% of the context window, and a 5% safety margin. The reserve floor
-is itself capped at half the window. The cut-point target passed to pi is
-derived from the model window as 20% of the hard budget clamped to
+The hard boundary is the model context window minus request headroom. Automatic
+compaction starts at 90% of `hardLimit`; this deterministic margin is not
+configurable. Headroom is the maximum of a 16,384-token reserve floor, model
+maximum output capped at 25% of the context window, and a 5% safety margin. The
+reserve floor is itself capped at half the window. The cut-point target passed
+to pi is derived from the model window as 20% of the hard budget clamped to
 8,000–64,000 tokens, then capped at half the hard budget; it decides where the
-boundary falls, not what survives it. The active-user retention limit is 20,000
-tokens, capped at half the hard budget so retention alone cannot fill a small
-window and leave the summary no room. None of these values are configurable.
+boundary falls, not what survives it. The active-user retention limit is
+20,000 tokens, capped at half the hard budget so retention alone cannot fill a
+small window and leave the summary no room. A fallback's window is capped by
+25% of the hard budget and by the room the carried-forward summary and the
+recovery notice leave, so recovery cannot install a checkpoint the guard
+rejects. None of these values are configurable.
+
+**Estimate calibration (D606).** Every threshold above is compared against one
+number, corrected against observed request usage. pi's `estimateContextTokens`
+anchors on the last assistant usage and estimates everything after it as
+`chars / 4`: that constant under-counts CJK text, and with no anchor left it
+omits system/tool overhead. The budget also computes the output-cap estimator
+over non-system conversation messages plus the current system prompt and active
+tool schemas. System-transcript rows are metadata snapshots of that same prompt
+and are excluded from this component, so the request estimate counts the prompt
+and schemas exactly once. The budget uses the larger of this full-request
+estimate and the calibrated message estimate. This is a hard floor before the
+first calibration sample and prevents counting overhead twice after an
+unanchored residual has learned it.
+
+The calibration still measures the two errors separately — per-character bias
+as a scale-free ratio over the guessed tail, and an unanchored residual as a
+ratio only for observations taken at a comparable scale (0.5×–2× of the
+message estimate), otherwise as the observed overhead capped at 32,000 tokens.
+
+The correction is asymmetric because this number gates compaction: upward
+applies once three observations exist, downward needs three agreeing samples,
+is capped at 15 % per step and can never take the value below 85 % of the raw
+estimate, so a projection at 1.18× the hard limit (`1 / 0.85`) still compacts.
+A report outside 0.5×–3× of what the calibration predicted is treated as a
+misreport, and two consecutive misreports freeze the downward direction until a
+usable report arrives.
+
+
+The provider request layer also caps the concrete output budget before every
+parent, subagent, and one-shot request. It estimates the serialized input with
+the pi-ai chars/4 baseline plus a CJK correction, then reserves the larger of
+4,096 tokens or 1% of the effective window. The effective window is the smaller
+of the configured value and the published catalog window when both are known;
+this prevents an oversized user override from bypassing compaction and output
+protection. Unknown windows preserve the configured output budget.
 
 The incoming user prompt participates in budgeting before the first provider
-request. If normal compaction fails during an automatic threshold or overflow
-recovery, the runtime persists a short recovery checkpoint with the previous
-summary (when available) and an aggressively bounded applicable tail. The
-complete transcript remains durable and visible, while the next model request
-receives only that recovery checkpoint and applicable tail. The lifecycle event marks
-this as `fallback: "retained_tail"` so the renderer can show a warning rather
-than a false success. If the fallback cannot be prepared, persisted, or kept
-below the safe budget, the user row and an assistant error remain durable and
-no provider request starts. Provider-reported context overflow is the last
-recovery layer: omit the failed assistant from model context, compact once,
-and retry once. A second overflow remains terminal. Bedrock's
-`prompt is too long: N tokens > M maximum` form maps to this path.
+request. The automatic summary request retries transient provider failures
+under a bounded pi-ai retry policy (3 retries, 2s/4s/8s backoff, cancelled by
+Stop); deterministic failures such as quota or auth return at once. The
+preflight guard sizes the prompt pi actually serializes — tool results already
+capped — rather than the raw messages, and when that prompt still exceeds the
+window it tries exactly one reduced input (tool results cut to a short prefix,
+thinking dropped, no message removed). If even that input does not fit, the range
+is split into contiguous chunks that each do: at most 16 requests, each carrying
+the previous chunk's summary through pi's update-the-summary prompt, with the
+range's file list appended on the last one, and the checkpoint reports the summed
+usage of the requests that produced it. A budget therefore decides how many
+requests a summary takes, not whether the model is asked at all (ADR 0302); only
+an empty range, or one past that request bound, still gives up on the summary
+(ADR 0282). If normal compaction still fails during an automatic threshold or
+overflow recovery, the runtime persists a short recovery checkpoint with the
+previous summary (when available) and the bounded recent window described above.
+The complete transcript remains durable and visible, while the next model
+request receives only that recovery checkpoint and applicable tail. The
+lifecycle event marks this as `fallback: "retained_tail"`, and the checkpoint's
+mark carries the same `fallback`, so the renderer shows a warning and labels
+the transcript row as a failed summary rather than a false success. If the
+fallback cannot be prepared, persisted, or kept below the safe budget, the user
+row and an assistant error remain durable and no provider request starts.
+Provider-reported context overflow is the last recovery layer: omit the failed
+assistant from model context, compact once, and retry once. A second overflow
+remains terminal. Bedrock's `prompt is too long: N tokens > M maximum` form
+maps to this path.
 
 Automatic protection is always enabled and is not user-configurable. The
 runtime still accepts a construction-time override that disables it, used by
@@ -441,6 +583,19 @@ tests; persisted `contextCompaction` settings are ignored so a session cannot
 be left with the guard off and no way to restore it. Manual `/compact` remains
 available while the session is idle. Checkpoint generation is abortable and
 counts as running state until durable persistence completes.
+
+The file list a checkpoint carries is read out of the summarized range by pi's
+own collector, which recognizes the lowercase spellings `read` / `write` /
+`edit` — the names pi's tools carry. PI-Desktop registers `Read` / `Write` /
+`Edit`, so the runtime converts exactly those three on the way into pi's
+preparation (`withPiFileOpToolNames`): nothing stored changes, and every other
+tool name is left spelled the way we register it. Without that conversion a
+checkpoint's `readFiles` / `modifiedFiles` and the `<read-files>` section of a
+summary were always empty (D618).
+
+A delegate (§5f) runs the same derivation against its own resolved model and
+compacts at its own turn boundaries, without a durable checkpoint chain of
+its own (ADR 0299).
 
 ## 5b. Operating mode and planning state
 
@@ -495,6 +650,16 @@ submitted Markdown bytes in a new immutable
 structured title/question in `plan_approvals`, and moves the live state to
 `awaiting_approval`.
 
+Plan/Goal requests retain Write/Edit declarations and, when subagents are
+configured, the Task/TaskWait/TaskList/TaskStop declarations. They are marked
+unavailable in the active mode. The execution allowlist remains unchanged:
+prohibited calls are blocked before extension call hooks and handlers, and a
+handler retained across a mode change rechecks that mode before executing.
+The model receives an ordinary error tool result with the original call id;
+no editing, delegation, fake user message or transcript deletion occurs.
+Other deferred/plugin tools keep their existing visibility rules. See
+[the declaration/permission decision](../../adr/plan-tool-declarations-and-execution-denials.md).
+
 Approval has only `approve` and `reject`. Approval commits `mode = agent`, the
 explicit permission mode, an execution ID, and `execution_state = queued` on
 the same `plan_approvals` row in one host transaction. The
@@ -537,8 +702,11 @@ criterion-by-criterion report of what was met and the evidence observed.
 ## 5c. Thinking capability and stream contract
 
 - Canonical levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`,
-  and `max`.
-- The bundled models.dev release snapshot is authoritative for published
+  and `max`. Session (and subagent) selectors also accept `omit`, which is
+  not a catalog/binding capability: the runtime keeps agent bookkeeping at
+  `off` and uses the low-level provider stream so no thinking override is
+  synthesized (ADR 0194 / ADR 0295).
+- The bundled Pi catalog release snapshot is authoritative for published
   reasoning support, thinking-level mapping, limits, input/output modalities,
   pricing, and other model metadata. pi-ai remains responsible for request
   serialization and adapter compatibility.
@@ -546,7 +714,7 @@ criterion-by-criterion report of what was met and the evidence observed.
   limits, or other model metadata. The explicit attachment capability fields
   are the exception: `supportsImages` and `supportsDocuments` are effective
   binding overrides for the endpoint.
-- Unsupported requested levels use the selected models.dev model's
+- Unsupported requested levels use the selected Pi catalog model's
   nearest-supported-level rule: scan upward first, then downward. A
   non-reasoning provider always resolves to `off`.
 - Vision support starts from the same published model record. An absent or
@@ -572,14 +740,47 @@ criterion-by-criterion report of what was met and the evidence observed.
   restores as an errored result; a tool row whose assistant row was lost
   gets a synthesized call-only assistant carrier so call/result pairs stay
   well-formed for every provider API.
-- Vision runtimes hydrate persisted image refs only from the session-bound
-  attachment, scratch, and project roots. Images within the 10 MB inline
-  safety bound become transient pi-ai image blocks; oversized or unavailable
-  images become safe `@path` fallbacks. Oversized history hydration copies
-  files without first loading their contents into memory. Base64 is never
-  restored into durable UI messages or transcript records.
+Vision runtimes hydrate persisted image refs only from the session-bound
+attachment, scratch, and project roots. Each image remains subject to the 10 MB
+safety bound, and restored history has a 30 MB aggregate raw-byte budget.
+The newest refs are considered first; all eligible images remain image blocks
+when the history fits, while over-budget or oversized images become safe
+`@path` fallbacks. Reads are bounded by the admitted file size. Base64 is
+transient and never restored into durable UI messages or transcript records.
 - Failed assistant messages remain durable diagnostic transcript entries but
   are never restored into pi model context on a later turn.
+- A tool-call id is unique in every request. The transcript is an append-only
+  snapshot stream that tolerates a retried append, so the same call can reach
+  the assembled context twice — under one row id, which the host's keep-last
+  read already collapses, or under two, which it cannot. The last view before
+  the wire therefore keeps the first occurrence of each `toolCall` id and drops
+  a later call or a later result for it, so the pair the provider validates
+  stays well-formed; a request with no duplicates is returned unchanged. A drop
+  is reported once on the `agent` log channel with the session and the ids
+  (D608). Anthropic-family endpoints, including DeepSeek's, reject the whole
+  turn with `tool_use ids must be unique` (issue #718), which leaves the session
+  unable to continue.
+- The guard compares the wire-visible call id — the part before the `|` that
+  separates the Responses item id — and drops an assistant message whole once
+  every tool call in it was already claimed, because keeping its residual text
+  would leave a message sitting between a call and the result answering it. A
+  message that replays a claimed call while carrying a new one keeps its new
+  call in place; no writer produces that partial replay, and the guard does not
+  reorder messages to close the gap it leaves (D620).
+- The agent loop owns its context array. `prepareNextTurn` hands pi a copy of
+  the live state — for a delegate turn boundary too — exactly as pi's own
+  `createContextSnapshot()` does for `prompt()` and `continue()`: pi's loop
+  appends each streamed assistant message and each tool result to the array it
+  was given, while its `message_end` listener appends the same message to
+  `state.messages`, so handing over the live array stored every message of a
+  run's later iterations twice. The next turn's first request was built from
+  that array, and the duplicate of an assistant message carrying text plus a
+  tool call survived as a text-only clone between the call and its result —
+  pi-ai then closed the still-pending call with a synthesized output next to the
+  real one, and the endpoint rejected the turn with
+  `Duplicate tool output for call_id`. In a delegate the same doubling doubled
+  the estimate at the following boundary and left the trailing row a fallback
+  carries onto a model it cannot resume from (D620).
 - Restored checkpoints clear provider usage from retained assistant messages
   for budgeting. That usage measured the pre-compacted request and must not
   make the summary + tail appear as large as the discarded context.
@@ -604,8 +805,9 @@ builtins shipped inline in `agent-runtime` (`explorer`, `code-reviewer`,
 `test-runner`, `fixer`, `ui-designer`) and the global user documents under
 `~/.agents/subagents/*.md`. There is no project-level subagent directory and
 `.pi/agents` is not scanned for capabilities. User documents are filtered by
-the app-local enabled state before they reach the loader. Electron main loads
-the global catalog on every launch and passes `subagents` /
+the app-local enabled state before they reach the loader, and the shipped
+builtins are filtered by that same app-local state inside it (ADR 0270).
+Electron main loads
 `subagentProviders` in the sidecar params, so editing a definition takes effect
 on the next prompt. The catalog is capped at `MAX_SUBAGENT_DEFINITIONS` (16);
 a malformed or unreadable document becomes a launch diagnostic and never fails
@@ -633,7 +835,7 @@ intentional override.
 mode and only when the catalog is non-empty, and all four belong to the Agent
 core set rather than the on-demand catalog of §7.1:
 
-- `Task(agent, task, description?, model?)` — validates its arguments (an
+- `Task(agent, task, description?, model?, resume?)` — validates its arguments (an
   unknown `agent`, an empty `task`, an unresolvable model pin and a definition
   whose tools are all unavailable each return a tool error explaining the
   failure rather than throwing), starts the delegate **in the background**, and
@@ -653,7 +855,9 @@ core set rather than the on-demand catalog of §7.1:
   include definition-only pins, while only the former authorizes cached
   overrides and the model summary. Missing keys default to an empty list;
   successful on-demand resolution is cached separately from launch opt-in and
-  does not rewrite definition pins or runtime reuse matching. On-demand
+  does not rewrite definition pins or runtime reuse matching. Grants expire at
+  each new parent prompt or approved plan/goal execution; late responses from
+  an older turn cannot repopulate the cache. On-demand
   provider matching uses the same unique id/vendor/name rule as pin resolution.
   A changed opt-in list retires the idle runtime on the next launch. Pins remain usable
   by their own definitions when `model` is omitted or when `Task.model` repeats
@@ -705,7 +909,7 @@ No new event type or storage schema is required.
 process with the definition's system prompt, its (possibly pinned)
 provider/model, its declared tools, and the same host connection. A pinned or
 explicitly selected delegation model uses the exact provider/model binding
-saved in Settings for its effective thinking capability; models.dev supplies
+saved in Settings for its effective thinking capability; Pi catalog supplies
 the baseline only. It runs under
 the same bounded provider retry policy as the parent. A delegate has no turn
 limit: it ends when it finishes, when the parent calls `TaskStop`, when the user
@@ -727,10 +931,11 @@ keyboard-focus, and reduced-motion checks require project-provided browser
 tests or other tooling. Its statuses are `completed`, `failed`,
 `aborted`, `timed_out` and the registry-only `stopped`;
 the terminal ones surface through `TaskWait`, whose text is
-the report (bounded to `MAX_SUBAGENT_REPORT_CHARS`, 12k) and whose details
+the report (bounded to `MAX_SUBAGENT_REPORT_CHARS`, 12k; when exceeded, persisted to session scratch with a pointer notice per ADR 0062) and whose details
 carry `delegationId`, `agent`, `modelId`, `thinkingLevel`, `status`, `startedAt`,
-`completedAt` when settled, `turns`, `toolCalls` and, on failure or timeout,
-`error`. The same effective model and thinking fields are included in the
+`completedAt` when settled, `turns`, `toolCalls`, and `scratchReportPath` when
+the full report was spilled to scratch; on failure or timeout they carry
+`error` (including resume ID hints on `SUBAGENT_OUTPUT_TRUNCATED`). The same effective model and thinking fields are included in the
 immediate `Task` result and in lifecycle snapshots so live and restored
 delegation views do not re-derive them from definitions or parent settings.
 `startedAt` and `completedAt` are runtime timestamps in milliseconds and are the source of
@@ -741,23 +946,91 @@ duration only covers starting the background work.
 duration-timeout a delegate. `idle-timeout` / `max-duration` frontmatter still
 parses so old documents load, but those values are not armed. A delegate runs
 until it finishes, fails, is `TaskStop`'d, or the user Stops / the runtime is
-disposed. The parent agent judges whether to
-cancel via `TaskStop`; a one-line heartbeat (who, status, elapsed, turns, last
-tool) is what it has to go on while the delegate is running.
+disposed. The parent agent judges whether to cancel via `TaskStop`; a one-line
+heartbeat (who, status, elapsed, turns, last tool) is what it has to go on while
+the delegate is running.
 
 When the parent stops calling tools while delegates are still running, the
 runtime swallows that `agent_end`, keeps the durable turn open, waits for the
-delegates, and prompts the parent with their reports. Ending the parent loop
-does not abort them.
+delegates, and prompts the parent with their reports. Every terminal result
+resolves the parent wait before best-effort transcript publication; a failed
+`SubagentRun` initialization returns a tool error and never leaves a running
+record. User Stop and runtime disposal also abort the parent wait signal, so
+they can end the parent turn even if a delegate ignores its abort. Ending the
+parent loop does not otherwise abort delegates.
 
 Fatal provider/stream errors (including exhausted HTTP 429) and parent aborts
-retain their existing `failed` and `aborted` outcomes. A terminal parent error
-also aborts leftover delegates,
-skips the resume prompt, and returns the session to idle so Continue is not
-`AGENT_BUSY` (D352).
+retain their existing `failed` and `aborted` outcomes. If an assistant response
+ends at the provider's output-token limit (`stopReason: "length"` or
+`"max_tokens"`) after emitting report text, the delegate instead settles as
+`failed` with `SUBAGENT_OUTPUT_TRUNCATED` and `outputTruncated: true`; its
+bounded partial report remains under the failure explanation for diagnosis. A
+later delegate turn that ends normally clears the marker and can complete. A
+terminal parent error also aborts leftover delegates, skips the resume prompt,
+and returns the session to idle so Continue is not `AGENT_BUSY` (D352).
+
+**Resumable delegations (ADR 0279).** `Task` accepts an optional `resume`
+parameter carrying the `delegationId` of a settled delegation in the same
+conversation. The resumed delegate is a new `SubagentRun` seeded with the
+chain's prior messages — the original `task` brief plus every row the chain
+produced — and then prompted with the new `task`, so a delegate that already
+read or changed a file continues from that context instead of starting cold.
+Seeding is transcript-backed: the chain's rows are exactly those carrying
+`parentToolCallId` for one of the chain's `Task` calls, and they are converted
+into provider messages with the delegate's own binding (a pinned delegation
+model is not the session model). Nothing is kept warm in memory and no new
+event type, storage schema, or tool parameter is introduced.
+
+A chain is the sequence of `Task` calls that share one delegate session: the
+first call, plus every later call that passed the earlier `delegationId` as
+`resume`. The runtime rebuilds the chain index from the persisted transcript at
+launch — each `Task` row carries its own `delegationId` and settled status in
+`toolResult.details` and the resumed id in `toolArgs.resume`, with the agent
+name normalized on rebuild — so resumability survives a sidecar restart.
+Chain identity (`delegateSessionId`) stays internal; the parent only
+ever passes a `delegationId`, and the reverse map resolves it.
+
+Only `completed` and `failed` chains are resumable; `stopped` and `aborted` runs
+are terminal and revive only by starting a new delegation, and a run the app
+closed while it still worked rebuilds as `interrupted`, which is not resumable
+either. A chain whose read-only tool output exceeds `MAX_RESUMABLE_READ_LINES`
+(50000) leaves the reusable list without an in-chain trim, so a resume never
+silently drops history. The registry keeps at most
+`MAX_RESUMABLE_CHAINS_PER_AGENT` (2) reusable chains per definition name and
+evicts least-recently-active ones whenever a delegation settles; a chain that is
+still working is never evicted, so the bound counts reusable chains and a live
+chain may sit above it until it settles.
+
+Resume is strictly same-session and never queues: resuming a running
+delegation is a tool error telling the parent to converge with `TaskWait`
+first, and a chain has at most one live record at a time. `model` and `resume`
+together are rejected, and a resumed run keeps the chain's recorded binding:
+the `providerId/modelId` key it resolved is preferred and reauthorized on demand
+when its turn grant has expired. A chain rebuilt from the transcript is matched
+by model id only among the current definition pin/fallbacks, the session binding,
+and currently authorized overrides. Other definitions' private pins are excluded.
+A known key never falls through to another account just because its model id
+matches. When nothing authorized resolves it the run
+continues on the definition's current binding and records the previous model id
+as `modelChangedFrom` in its lifecycle details. Changing models on purpose means
+starting a new delegation. An unknown id, an id belonging to another definition,
+a non-resumable status, an over-budget chain, and a chain whose rows are gone
+each return a tool error naming the reason and, for an unknown id, the reusable
+ids when there are any.
+
+The parent discovers reusable chains through the system prompt, which lists
+each chain's latest `delegationId`, its objective, and up to
+`MAX_RESUMABLE_LISTED_FILES` (8) of the files it read (with a `(+N more)`
+suffix past that). The list is recomposed when a delegation settles, around the
+existing prompt sections. A resumed run is an ordinary delegation for
+`MAX_SUBAGENT_CONCURRENCY`, `TaskWait`, `TaskList`, `TaskStop`, and lifecycle
+snapshots. The immediate `Task` result and the lifecycle details add
+`resumedFrom` for audit; the transcript renders a chain as one continuous
+multi-turn conversation under its latest `Task` card, with no separate
+"resumed" marker.
 
 **Model pins.** `model: <provider>/<model>` in the frontmatter is resolved once
-per launch in Electron main, where credentials and the models.dev snapshot live, against
+per launch in Electron main, where credentials and the Pi catalog snapshot live, against
 provider id, vendor key or display name, and capped at
 `MAX_SUBAGENT_PROVIDERS` (8) distinct providers. An unresolvable pin is omitted
 from the binding map on purpose; the runtime turns the missing entry into a tool
@@ -801,6 +1074,43 @@ and additive `modelFailures` lifecycle detail. Lifecycle model/thinking fields
 track the effective alternative, including after settlement and reload. If all
 alternatives fail, the result remains `failed` with the final provider error.
 See [ADR subagent-model-fallback](../../adr/subagent-model-fallback.md).
+
+**Context budget and compaction (ADR 0299, D623).** A delegate has the same
+window protection the session has, derived the same way. The budget comes
+from the model the run actually resolved — a `Task.model` override, a
+definition pin, or the inherited session model — through the shared
+derivation of §5.1, so `hardLimit` is that window minus the same request
+headroom and a per-definition `maxTokens` cap participates as the output
+budget. At a delegate turn boundary the run re-estimates its own context and
+starts compaction at `floor(hardLimit * 0.9)`, before the next provider
+request. A compaction result must still fit below `hardLimit`; that remains
+the non-negotiable provider-request guard. The retention mode follows the
+same lifecycle rule as the session, and there is no pre-computation.
+
+When a summary cannot be generated or installed below the hard limit, the run
+degrades: it keeps the original task brief plus the most recent message(s),
+discards the rest of its history, continues, and records that it was degraded,
+so the report and lifecycle details say the delegate lost history rather than
+presenting a complete answer. When even that does not fit, the run fails with
+`SUBAGENT_CONTEXT_OVERFLOW` (not retriable) naming what the parent can change —
+narrow the task, delegate to a model with a larger window, read less at once —
+instead of forwarding the provider's overflow text.
+
+An ordered alternative (**Ordered model fallback**, above) is re-evaluated
+against its own window before it is attempted: an alternative whose budget
+cannot hold the carried context is skipped and recorded in `modelFailures`
+with that reason rather than retried into the same failure. A resumed chain
+is seeded within the budget — `seedDelegateMessages` preserves the original
+task brief and the recent turns and drops the oldest tool results first — so
+a resume starts below `hardLimit` instead of overflowing on its first
+request.
+
+Delegate compaction affects the delegate's model context only. It rewrites no
+persisted transcript row, writes no host-core checkpoint, and adds no
+compaction row, warning toast, or context-inspector line; the delegate keeps
+its complete visible rows and the parent still sees only reports. Compaction
+is entirely automatic: `new_context` remains denied to delegates, because
+executing it would set the parent runtime's pending-compaction flag.
 
 **Events and context.** Every event a delegate emits carries
 `parentToolCallId` and `agentName` on its envelope, and Electron main copies both
@@ -892,10 +1202,10 @@ MVP UI always includes at least:
 
 Runtime responsibilities:
 - resolve `(providerId, modelId)`
-- resolve and serialize the complete models.dev record, or label an absent ID
+- resolve and serialize the complete Pi catalog record, or label an absent ID
   with the unknown generic fallback
 - resolve model reasoning capability and effective thinking level from the
-  models.dev record
+  Pi catalog record
 - fetch secrets via host (never cache raw secrets in logs)
 - translate vendor failures into provider AppError codes
 - stream tokens/events to orchestrator
@@ -917,10 +1227,10 @@ accepts the request.
 
 ### 6.2 OpenCode session routing headers
 
-Chat, subagent, prompt-enhancement, and plugin one-shot completions whose
-provider is `apiStyle: opencode_go`, whose `vendorKey` is `opencode` or
-`opencode-go`, whose pi-ai provider id is one of those values, or whose base
-URL host is `opencode.ai` send:
+Chat, subagent, context-compaction summary, prompt-enhancement, and plugin
+one-shot completions whose provider is `apiStyle: opencode_go`, whose
+`vendorKey` is `opencode` or `opencode-go`, whose pi-ai provider id is one of
+those values, or whose base URL host is `opencode.ai` send:
 
 - `x-opencode-session`: the durable conversation id, or a per-call UUID when
   the caller has no session
@@ -931,10 +1241,30 @@ Caller-supplied headers override the client and User-Agent defaults. An empty
 session header is restored from the conversation id so OpenCode Go cannot
 return `MissingSessionID`. A provider-row `headers` map is applied after this
 merge (headers plus a fetch wrapper) so custom values win over the OpenCode
-default and over adapter last-writes. Reserved keys cannot smash
+default and over adapter last-writes. The Google adapters take the merged
+`headers` without the wrapper, because they reject any other `fetch`
+(issue #1072). Reserved keys cannot smash
 `x-opencode-session`. This is an agent-runtime concern, matching the
 official Pi coding-agent attribution layer; pi-ai's `sessionId` stream option
 does not emit `x-opencode-session`.
+
+The context-compaction summary is a provider request of the same kind, but the
+harness assembles its own stream options and never passes the session's stream
+function, so agent-runtime applies the header merge to the model collection it
+hands to compaction. That request carries the session's conversation id rather
+than the per-call id the harness would otherwise mint, so a summary reaches the
+same gateway backend as the conversation it summarizes.
+
+The same seam restores the conversation key itself. pi-agent-core asks for
+`cacheRetention: "none"` on a summary, and the Responses-shaped adapters read
+that as "no `prompt_cache_key`", so the summary alone drops the identity every
+other turn sends; a gateway fronting a Codex backend rejects such a request with
+400 `invalid_responses_request`. For `openai-responses` and
+`openai-codex-responses` the summary payload therefore carries the session id as
+`prompt_cache_key` (clamped to the adapter's 64-character limit) unless the
+adapter or a caller already set one. Every other wire API keeps its payload
+exactly as the adapter built it, and the key is added on a copy, so a caller's
+payload hook keeps its own object and its return value still wins.
 
 
 ## 7. System prompt composition
@@ -947,6 +1277,31 @@ does not emit `x-opencode-session`.
 + [project instruction chain, when present]
 + [optional user custom instructions]
 ```
+
+### 7.0.1 User custom system prompt files (issue #542)
+
+The `[optional user custom instructions]` layer is the pi-compatible file pair
+`SYSTEM.md` / `APPEND_SYSTEM.md`, discovered per session launch from
+`<workspace>/.pi/` (project) and `~/.pi/agent/` (global), each kind picking a
+single winner with project over global, exactly like pi CLI. A change to the
+resolved content retires the runtime through the reuse match, so the next
+prompt recomposes; the files are not re-read per tool call like the project
+instruction chain. Native-pi sessions keep resolving them through the upstream
+`DefaultResourceLoader` as before.
+
+Two deliberate deviations from pi CLI's semantics:
+
+- `SYSTEM.md` replaces only the base product persona line, not the whole
+  prompt: the operational rules below (collaboration, search, edit contract,
+  scratch, delegation, skills) are desktop mechanics a persona file must not
+  remove.
+- `APPEND_SYSTEM.md` is appended after the composed base prompt and before
+  the project instruction chain, matching pi's ordering, so the user's own
+  `AGENTS.md` keeps the last word.
+
+Both files are capped at 64 KiB, and a whitespace-only file counts as absent.
+Native `SYSTEM.md` / `APPEND_SYSTEM.md` resolution in a native-pi session is
+unaffected: it stays with the upstream loader.
 
 The base prompt states collaboration rules explicitly, because omitting them
 is what produced silent sessions: "prefer concise, actionable answers" was the
@@ -1017,16 +1372,18 @@ one-line descriptions appear in an `# On-demand tools` catalog; parameter
 schemas do not. The catalog is bounded so a plugin with many tools cannot
 recreate the original prompt bloat.
 The model calls `ToolSearch` with an exact name or a short capability query.
-The sidecar activates up to four matches, returns their names through
-pi-agent-core's `addedToolNames`, and rebuilds the next-turn context with those
+The sidecar activates up to four matches, records their names in the canonical
+`details.addedToolNames` field, and rebuilds the next-turn context with those
 schemas. Providers with native deferred-tool search receive the definitions at
 that load point; other providers receive the active definitions normally.
 
 At the start of each new user prompt, the sidecar clears the in-memory deferred
 activation set and rebuilds it from the effective context. Successful
-`ToolSearch` results contribute their `addedToolNames`; successful results from
-deferred tools contribute that tool's name. Only names still present in the
-current mode's deferred catalog are restored. Failed rows, interrupted or
+`ToolSearch` results contribute their canonical `details.addedToolNames`.
+For compatibility, historical `details.activated` and top-level
+`addedToolNames` markers are also accepted. Successful results from deferred
+tools contribute that tool's name. Only names still present in the current
+mode's deferred catalog are restored. Failed rows, interrupted or
 missing-result placeholders, and assistant/user prose never activate a tool.
 The tool registry, host permission path, tool timeout, and workspace containment
 rules remain unchanged. `ToolSearch` is local to the sidecar and does not cross
@@ -1210,6 +1567,14 @@ with the original v3 `SessionManager`, Pi `ModelRuntime`, `SettingsManager`, and
 leaf, compaction, model/thinking changes, and context-bearing custom messages;
 it is never reconstructed from renderer `UiMessage` rows.
 
+The 0.99.1 SDK also applies append-only `context_edit` entries to this model
+projection. An edit can omit or replace an earlier message for later provider
+requests without rewriting its raw JSONL entry or the visible native history.
+Native Pi extensions use the SDK's boundary hooks; all entries they append,
+including context edits, pass through the sidecar's lease and parent-chain
+guard. This native extension lifecycle is separate from the Desktop Agent
+extension adapter described in [trusted extensions](../07-plugins/16-trusted-extensions.md).
+
 The first native slice supports text prompt **without model tools**, stop/abort,
 and explicit refresh. `createAgentSession` receives `noTools: "all"`; neither
 built-in nor extension tools may bypass Desktop permissions. Tool parity awaits
@@ -1231,9 +1596,6 @@ device/inode/size/hash before it is projected or registered; an altered file
 fails closed without returning a child. A fork is a data-only copy: it executes
 no model and loads no project resources, so it stays available while the parent
 is provider-unavailable or project-untrusted, without granting prompt
-readiness. The side-chat panel streams the child's provisional assistant row
-and re-keys exactly that row when persistence reports the durable SDK entry id
-through the additive `replacesMessageId` field.
 
 ModelRuntime performs its public offline initialization to restore the local
 catalog and auth snapshot. Native Composer readiness uses native `canPrompt`,
@@ -1254,3 +1616,38 @@ no Desktop provider fallback. Missing cwd, required project trust, unsupported
 format, repair-needing newline, unavailable provider/auth, active lease, or
 external byte change makes continuation fail closed while detail remains
 browseable.
+
+### Provider certificate trust (issue #714)
+
+The desktop sidecar's effective trust set is the union of Node's bundled
+roots, the inherited `NODE_EXTRA_CA_CERTS` set, and the OS trust store, with
+chain and hostname validation on. On Windows and Linux the launcher passes
+Node's `--use-system-ca` to obtain the system roots. On macOS the Electron
+build applies that flag by replacing the bundled roots instead of adding them
+and its system enumeration misses public anchors (issue #1187), so the
+launcher omits the flag and the sidecar merges the three sets into the default
+CA set itself at startup (`agent-runtime system-ca`). Restart after updating
+local trust or the extra-CA startup environment. Headless pi-host launch
+behavior and System/Direct/Custom proxy routing are unchanged.
+
+Explicit certificate verification errors are terminal for both setup and
+stream recovery in main sessions and built-in delegates. Their structured
+cause survives adapter message flattening, remains on the final error row,
+and never triggers a provider transport rebuild. Protocol errors such as
+`EPROTO` keep their existing retry behavior. See
+[certificate trust ADR](../../adr/provider-system-certificates.md).
+
+## Pi 0.99.1 execution boundary
+
+Published model metadata and account entitlement come from one account-scoped
+Pi Models collection. Effective binding projection is shared by launch, delegates
+and compaction. Dispatch thinking normalization uses the resolved physical Pi
+model; native null/unsupported mappings remain unavailable without mutating
+saved preferences. Agent bookkeeping and omitted request reasoning are distinct.
+
+Every physical stream attempt has an operation identity before dispatch. Usage
+survives stream/result projection and events through Host/remote/renderer paths;
+retries and images retain physical account/model attribution. Nested immediate
+parent and owning Task remain distinct. The migration does not add coding-agent
+AgentSession, Codemode or virtual routing. See the coding-agent design review for
+future adoption conditions.

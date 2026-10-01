@@ -1,3 +1,9 @@
+import {
+  KEYBOARD_SHORTCUTS,
+  keybindingDisplayParts,
+  resolveKeybinding,
+  type ShortcutPlatform,
+} from "@pi-desktop/shared";
 import { useTranslation } from "react-i18next";
 import { useAppStore } from "../stores/app-store";
 import {
@@ -20,15 +26,6 @@ function isDefaultSessionTitle(title?: string | null) {
   return ["new task", "new chat", "新建任务", "新对话"].includes(trimmed);
 }
 
-const TOPBAR_TITLE_MAX_LENGTH = 10;
-
-function truncateTopbarTitle(title: string) {
-  const characters = Array.from(title);
-  return characters.length > TOPBAR_TITLE_MAX_LENGTH
-    ? `${characters.slice(0, TOPBAR_TITLE_MAX_LENGTH).join("")}…`
-    : title;
-}
-
 export function ConversationTopbar({
   sidebarCollapsed,
   workPanelOpen,
@@ -46,13 +43,46 @@ export function ConversationTopbar({
   const activeSessionId = useAppStore((s) => s.activeSessionId);
   const sessions = useAppStore((s) => s.sessions);
   const workspace = useAppStore((s) => s.workspace);
+  const keybindings = useAppStore((s) => s.settings?.keybindings);
+  const platform = (
+    typeof window === "undefined" ? "darwin" : window.piDesktop?.platform ?? "darwin"
+  ) as ShortcutPlatform;
+  const newTaskShortcut = KEYBOARD_SHORTCUTS.find(
+    (shortcut) => shortcut.id === "newTask",
+  );
+  const searchShortcut = KEYBOARD_SHORTCUTS.find(
+    (shortcut) => shortcut.id === "openSearch",
+  );
+  const newTaskBinding = newTaskShortcut
+    ? resolveKeybinding(newTaskShortcut, keybindings, platform)
+    : null;
+  const searchBinding = searchShortcut
+    ? resolveKeybinding(searchShortcut, keybindings, platform)
+    : null;
+  const newTaskShortcutLabel = keybindingDisplayParts(newTaskBinding, platform).join(
+    platform === "darwin" ? "" : "+",
+  );
+  const searchShortcutLabel = keybindingDisplayParts(searchBinding, platform).join(
+    platform === "darwin" ? "" : "+",
+  );
+  const newTaskTooltip = newTaskShortcutLabel
+    ? t("nav.actionWithShortcut", {
+        action: t("nav.newTask"),
+        shortcut: newTaskShortcutLabel,
+      })
+    : t("nav.newTask");
+  const searchTooltip = searchShortcutLabel
+    ? t("nav.actionWithShortcut", {
+        action: t("nav.search"),
+        shortcut: searchShortcutLabel,
+      })
+    : t("nav.search");
 
   const activeSession = sessions.find((session) => session.id === activeSessionId);
 
   const fullTaskTitle = isDefaultSessionTitle(activeSession?.title)
     ? t("chat.untitledTask")
     : activeSession?.title || t("chat.untitledTask");
-  const taskTitle = truncateTopbarTitle(fullTaskTitle);
   const project = projectName(workspace?.path, workspace?.name);
 
   return (
@@ -85,7 +115,7 @@ export function ConversationTopbar({
           className="ct-title-wrap"
           title={project ? `${project} · ${fullTaskTitle}` : fullTaskTitle}
         >
-          <span className="ct-title">{taskTitle}</span>
+          <span className="ct-title">{fullTaskTitle}</span>
         </div>
       </div>
 
@@ -94,7 +124,7 @@ export function ConversationTopbar({
           <TooltipButton
             type="button"
             className="ct-icon-btn"
-            tooltip={t("nav.newTask")}
+            tooltip={newTaskTooltip}
             ariaLabel={t("nav.newTask")}
             onClick={onNewTask}
           >
@@ -103,7 +133,7 @@ export function ConversationTopbar({
           <TooltipButton
             type="button"
             className="ct-icon-btn"
-            tooltip={t("nav.search")}
+            tooltip={searchTooltip}
             ariaLabel={t("nav.search")}
             onClick={onOpenSearch}
           >

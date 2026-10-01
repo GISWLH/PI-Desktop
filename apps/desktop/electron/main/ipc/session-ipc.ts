@@ -9,10 +9,9 @@ import {
   draftMatchesExisting,
   providerCreateInputFromDraft,
   isModelConfigImportSource,
-  type ActivationScope,
   type ModelConfigImportDraft,
   type Mode,
-  type ThinkingLevel,
+  type SessionThinkingLevel,
 } from "@pi-desktop/shared";
 import {
   convertSession,
@@ -35,13 +34,8 @@ type RuntimeSession = {
   projectPath?: string | null;
   providerId?: string;
   modelId?: string;
-  thinkingLevel?: ThinkingLevel;
+  thinkingLevel?: SessionThinkingLevel;
   [key: string]: unknown;
-};
-
-type ImportableModelConfig = ModelConfigImportDraft & {
-  id?: string;
-  secretValue?: string;
 };
 
 let scannedImportSessions = new Map<string, ExternalSessionSummary>();
@@ -140,6 +134,15 @@ export function registerSessionIpc({
     if (!host) throw new Error("host unavailable");
     return host.call("search.context", input);
   });
+  handle(IPC.invoke.todosGet, async (input: { sessionId?: unknown } = {}) => {
+    if (!host) throw new Error("host unavailable");
+    if (typeof input.sessionId !== "string" || !input.sessionId.trim()) {
+      throw Object.assign(new Error("sessionId is required"), {
+        errorCode: ErrorCodes.INVALID_ARGUMENT,
+      });
+    }
+    return host.call("todos.get", { sessionId: input.sessionId });
+  });
   handle(IPC.invoke.sessionList, async () => {
     if (!host) throw new Error("host unavailable");
     const [result, native, { providers, defaults }] = await Promise.all([
@@ -210,7 +213,7 @@ export function registerSessionIpc({
           errorCode: ErrorCodes.INVALID_ARGUMENT,
         });
       }
-      if (activeTurns.has(sessionId)) {
+      if (activeTurns.has(sessionId) && !String(input.throughMessageId ?? "").trim()) {
         throw Object.assign(new Error("Cannot fork a running session"), {
           errorCode: ErrorCodes.AGENT_BUSY,
         });
@@ -532,7 +535,7 @@ export function registerSessionIpc({
         mode: Mode;
         providerId?: string;
         modelId?: string;
-        thinkingLevel?: ThinkingLevel;
+        thinkingLevel?: SessionThinkingLevel;
         permissionMode?: "inherit" | "ask" | "accept-edits" | "auto";
       },
     ) => {
@@ -567,14 +570,16 @@ export function registerSessionIpc({
   );
 
   handle(IPC.invoke.sessionImportScan, async () => {
-    const sessions = await scanAllSources();
+    const { sessions, truncated } = await scanAllSources();
     scannedImportSessions = new Map(
       sessions.map((session) => [`${session.source}:${session.externalId}`, session]),
     );
     return {
       sessions: sessions.map(({ filePath: _filePath, ...candidate }) => candidate),
+      ...(Object.keys(truncated).length > 0 ? { truncated } : {}),
     };
   });
+
   handle(
     IPC.invoke.sessionImportRun,
     async (selections: unknown) => {

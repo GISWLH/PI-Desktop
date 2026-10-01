@@ -1,5 +1,6 @@
 import type {
   AgentEventEnvelope,
+  BrowserState,
   AgentQueueChangedEvent,
   AgentStatus,
   AppNotification,
@@ -23,7 +24,8 @@ import type {
   ProviderPublic,
   ReviewRollbackResult,
   SessionSummary,
-  ThinkingLevel,
+  SessionThinkingLevel,
+  SessionTodoSnapshot,
   UiMessage,
 } from "@pi-desktop/shared";
 import type { SettingsTabId } from "../lib/settings-search";
@@ -36,8 +38,10 @@ import type {
 } from "../lib/sidebar-preferences";
 import type { PermissionQueues } from "../lib/pending-permissions";
 import type { AskQueues } from "../lib/pending-asks";
-import type { QueuedPrompts } from "../lib/queued-prompts";
-import type { SubagentPanelSelection } from "../lib/subagent-panel";
+import type {
+  QueuedPromptDirection,
+  QueuedPrompts,
+} from "../lib/queued-prompts";
 import type {
   ComposerDraftSnapshot,
   ComposerPrefill,
@@ -55,12 +59,16 @@ export type ToastItem = {
   variant: ToastVariant;
   /** Auto-dismiss delay in ms; 0 keeps the toast until dismissed. */
   duration: number;
+  /** Notification chime is enabled by default. */
+  sound: boolean;
 };
 
 export type ToastOptions = {
   variant?: ToastVariant;
   /** Override the variant default (4s, error 8s); 0 disables auto-dismiss. */
   duration?: number;
+  /** Suppress the default soft chime when another notification surface already played it. */
+  sound?: boolean;
 };
 
 export type AgentTurnResult = {
@@ -92,14 +100,12 @@ export type RefreshSessionsOptions = {
 /** Toolbar selections retained on the unpersisted new-task draft. */
 export type DraftSessionConfiguration = {
   mode: Mode;
-  thinkingLevel: ThinkingLevel;
+  thinkingLevel: SessionThinkingLevel;
   providerId?: string;
   modelId?: string;
   permissionMode?: PermissionMode;
 };
 
-import type { SideChatMap } from "../lib/side-chat";
-import type { ResponseAnnotationEditor, ResponseAnnotationMap } from "../lib/response-annotations";
 
 export type AppState = {
   ready: boolean;
@@ -125,6 +131,8 @@ export type AppState = {
   /** Latest user-selected session while its transcript/workspace is resolving. */
   selectingSessionId?: string;
   messages: UiMessage[];
+  /** Renderer-only visibility overrides; never persisted with transcript messages. */
+  dismissedAssistantErrorMessages: Record<string, true>;
   /** Session ids whose panes stay mounted, most recently visible first. */
   retainedSessionIds: string[];
   /** Last transcript each retained pane painted. */
@@ -143,7 +151,7 @@ export type AppState = {
   /** Latest terminal outcome per session for compact sidebar feedback. */
   sessionOutcomes: Record<string, SidebarSessionOutcome>;
   /** Every checkpoint a session has installed, oldest first. */
-  sessionCompactions: Record<string, ContextCompactionMark[]>;
+  sessionCompactions: Record<string, (ContextCompactionMark & { summary?: string })[]>;
   providers: ProviderPublic[];
   /** Discovered model lists per provider id (composer model menu). */
   providerModels: Record<string, ModelInfo[]>;
@@ -166,14 +174,19 @@ export type AppState = {
   pendingPlans: Record<string, PlanProposal>;
   /** Latest immutable Plan checkpoint/execution snapshot per session. */
   planCheckpoints: Record<string, PlanProposal>;
+  /** Host-authoritative Todo snapshots keyed by session. */
+  sessionTodos: Record<string, SessionTodoSnapshot>;
+  applyTodosChanged: (snapshot: SessionTodoSnapshot) => void;
   toasts: ToastItem[];
   notifications: AppNotification[];
   unreadNotificationCount: number;
-  page: "chat" | "pulls" | "scheduled" | "plugins" | "settings";
+  page: "chat" | "scheduled" | "plugins" | "settings";
   /** Tab ids come from the shared settings index. */
   settingsTab: SettingsTabId;
   /** Pending row anchor (i18n key) to flash after landing on a settings tab. */
   settingsAnchor: string | null;
+  /** Bumped by every setSettingsTab so a same-tab navigation is observable. */
+  settingsTabNonce: number;
   navStack: Array<{ page: AppState["page"]; sessionId?: string }>;
   navIndex: number;
   error?: string | null;
@@ -197,7 +210,7 @@ export type AppState = {
     mode: Mode;
     providerId?: string;
     modelId?: string;
-    thinkingLevel: ThinkingLevel;
+    thinkingLevel: SessionThinkingLevel;
     permissionMode?: PermissionMode;
   }) => Promise<void>;
   /** Returns true once accepted unless concurrent smart Stop restores it. */
@@ -205,6 +218,7 @@ export type AppState = {
     content: string,
     draft?: ComposerDraftSnapshot,
     targetSessionId?: string,
+    onAccepted?: (sessionId: string) => void,
   ) => Promise<boolean>;
   steerPrompt: (content: string, draft?: ComposerDraftSnapshot) => Promise<boolean>;
   enqueuePrompt: (
@@ -213,11 +227,20 @@ export type AppState = {
     sessionId?: string,
   ) => Promise<boolean>;
   removeQueuedPrompt: (promptId: string) => void;
+  /** Move one waiting row past its neighbour; promoted rows stay locked. */
+  moveQueuedPrompt: (
+    promptId: string,
+    direction: QueuedPromptDirection,
+  ) => Promise<void>;
+  /** Return one waiting row to the composer as an editable draft. */
+  editQueuedPrompt: (promptId: string) => void;
   sendQueuedNow: (promptId: string) => Promise<void>;
   refreshQueuedPrompts: (sessionId: string) => Promise<void>;
   applyQueueChanged: (event: AgentQueueChangedEvent) => void;
   compactContext: () => Promise<void>;
   retryAssistantMessage: (messageId: string) => Promise<void>;
+  /** Read canonical text before opening a user-message editor. */
+  prepareUserMessageEdit: (messageId: string, signal?: AbortSignal) => Promise<UiMessage | null>;
   /** Replace a user prompt and regenerate from it. */
   editUserMessage: (
     messageId: string,
@@ -226,6 +249,7 @@ export type AppState = {
   ) => Promise<boolean>;
   retryLastPrompt: () => Promise<void>;
   clearError: () => void;
+  dismissAssistantErrorMessage: (messageId: string) => void;
   activateMessageRevision: (rootUserId: string, revisionIndex: number) => Promise<void>;
   deleteMessage: (messageId: string) => Promise<void>;
   rollbackWorkspaceChange: (
@@ -239,6 +263,12 @@ export type AppState = {
     name: string;
     folders: string[];
     primaryPath: string;
+  }) => Promise<void>;
+  /** Clone a public git remote into a chosen folder, then create its project. */
+  createProjectFromGit: (input: {
+    name: string;
+    url: string;
+    parentPath: string;
   }) => Promise<void>;
   cloneProject: (url: string) => Promise<ProjectWorkspace | null>;
   /** Re-read the active workspace metadata without changing the visible project. */
@@ -296,7 +326,8 @@ export type AppState = {
   /** Reload contributed work panel views. */
   refreshPluginViews: () => Promise<void>;
   refreshNotifications: () => Promise<void>;
-  receiveNotification: (notification: AppNotification) => void;
+  /** Returns true only when this event was accepted as a new durable row. */
+  receiveNotification: (notification: AppNotification) => boolean;
   markNotificationRead: (id: string) => Promise<void>;
   markAllNotificationsRead: () => Promise<void>;
   clearNotifications: () => Promise<void>;
@@ -304,6 +335,8 @@ export type AppState = {
   /** Drop a session's sidebar outcome badge and read its task notifications. */
   acknowledgeSessionOutcome: (sessionId: string) => Promise<void>;
   restorePendingPlan: (sessionId: string) => Promise<PendingPlanRefreshResult>;
+  /** Re-read a session's open ask / permission cards from Main (reload recovery). */
+  restorePendingInteractive: (sessionId: string) => Promise<void>;
   refreshPlanCheckpoints: () => Promise<void>;
   handleAgentEvent: (envelope: AgentEventEnvelope) => void;
   handlePlansChanged: (event: PlanningStateEvent) => void;
@@ -328,8 +361,6 @@ export type AppState = {
   dismissToast: (id: number) => void;
   composerPrefill: ComposerPrefill | null;
   clearComposerPrefill: () => void;
-  /** Renderer-only subagent details selected from the transcript. */
-  subagentPanel: SubagentPanelSelection | null;
   workPanelOpen: boolean;
   workPanelTabs: WorkPanelTab[];
   activeWorkPanelTabId: string | null;
@@ -338,63 +369,8 @@ export type AppState = {
   workPanelWidth: number;
   /** Chat-initiated "preview this file" request consumed by the files viewer. */
   workPanelFileRequest: { path: string; seq: number; mimeType?: string } | null;
-  /** Toggle the selected subagent detail. */
-  toggleSubagentPanel: (delegationId: string) => void;
-  closeSubagentPanel: () => void;
-  /**
-   * Side chats opened from messages, keyed by their child session id. The child
-   * is a real forked session on the host; this map is what keeps it out of the
-   * visible conversation and inside the docked panel (D-LOCAL-message-quotes).
-   */
-  sideChats: SideChatMap;
-  /** Live transcript of each registered side chat, fed by the agent event stream. */
-  sideChatTranscripts: Record<string, UiMessage[]>;
-  /**
-   * Numbered annotations the user attached to assistant turns, keyed by the
-   * session that owns them. They are prompt attachments, not draft text: the
-   * next prompt carries them as a block and the send consumes them
-   * (ADR response-annotations / D-LOCAL-response-annotations).
-   */
-  responseAnnotations: ResponseAnnotationMap;
-  /**
-   * The comment editor's state (D-LOCAL-response-annotations); null while it is closed. It is owned by
-   * the session it was opened in and holds the excerpt snapshot the selection
-   * collapsed into.
-   */
-  responseAnnotationEditor: ResponseAnnotationEditor | null;
-  /** Append text to the visible conversation's draft without sending it. */
-  appendComposerDraftText: (text: string) => void;
-  /** Open the comment editor for one assistant turn's excerpt. */
-  openResponseAnnotationEditor: (input: {
-    messageId: string;
-    text: string;
-    /** Existing annotation to edit; omitted while the excerpt is unattached. */
-    annotationId?: string;
-    anchor?: ResponseAnnotationEditor["anchor"];
-  }) => void;
-  /** Save the editor's comment and close it; a stale target is dropped. */
-  saveResponseAnnotationEditor: (comment: string) => void;
-  /** Close the editor without saving its comment. */
-  closeResponseAnnotationEditor: () => void;
-  /** Drop one annotation from the visible session. */
-  removeResponseAnnotation: (id: string) => void;
-  /** Drop every annotation of the visible session. */
-  clearResponseAnnotations: () => void;
-  /** Quote one message, or a selection inside it, into the composer draft. */
-  quoteMessageIntoComposer: (input: {
-    /** Source title used by the attribution line. */
-    title: string;
-    /** Full message text; a non-blank selection wins over it. */
-    text: string;
-    /** Text the user selected inside the message, when there is one. */
-    selection?: string;
-  }) => void;
-  /** Open a side chat from a message; resolves to the child session id. */
-  openSideChat: (messageId: string) => Promise<string | null>;
-  /** Release a side chat, keeping its durable child session. */
-  closeSideChat: (sessionId: string) => void;
-  /** Quote a side chat's newest answer into the main conversation's draft. */
-  addSideChatReplyToMain: (sessionId: string) => void;
+  /** Open (or activate) the transcript tab of one delegated subagent. */
+  openSubagentTab: (delegationId: string, agentName?: string) => void;
   /** Abort one session's running turn, visible or not. */
   abortSession: (sessionId: string) => Promise<void>;
   openWorkPanel: () => void;
@@ -406,6 +382,11 @@ export type AppState = {
   replaceWorkPanelTab: (sourceTabId: string, tab: WorkPanelTab) => void;
   openWorkPanelTabForSession: (sessionId: string, tab: WorkPanelTab) => void;
   activateWorkPanelTab: (tabId: string) => void;
+  reorderWorkPanelTabs: (
+    sourceTabId: string,
+    targetTabId: string,
+    insertAfter: boolean,
+  ) => void;
   closeWorkPanelTab: (tabId: string) => void;
   collapseWorkPanel: () => void;
   /** Hide the visible panel while retaining its session-owned context. */
@@ -413,6 +394,7 @@ export type AppState = {
   setWorkPanelWidth: (width: number) => void;
   openFileInWorkPanel: (path: string, mimeType?: string) => void;
   openUrlInWorkPanel: (url: string) => void;
+  updateBrowserWorkPanelTab: (state: BrowserState) => void;
 };
 
 export type AppStateData = {

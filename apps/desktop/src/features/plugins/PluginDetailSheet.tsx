@@ -1,4 +1,6 @@
-import { Button, TooltipButton, cx } from "../../components/ui";
+import type { ReactNode } from "react";
+import { Button, TooltipButton, cx, portalOverlay } from "../../components/ui";
+import { useBlockingOverlay } from "../../lib/blocking-overlay";
 import {
   IconCheck,
   IconLink,
@@ -7,6 +9,7 @@ import {
   IconX,
 } from "../../components/icons";
 import { Markdown } from "../../components/Markdown";
+import { openHttpUrl } from "../../lib/open-http-url";
 import {
   formatBytes,
   formatDate,
@@ -20,6 +23,11 @@ import {
   versionWithdrawn,
 } from "./model";
 import type { PluginsPageModel } from "./usePluginsPage";
+
+function PluginDetailBlockingHost({ children }: { children: ReactNode }) {
+  useBlockingOverlay();
+  return <>{children}</>;
+}
 
 export function PluginDetailSheet({
   t,
@@ -37,11 +45,11 @@ export function PluginDetailSheet({
   installedDetail,
   busyId,
   queueInstall,
-  openUrlInWorkPanel,
   setSelectedVersion,
 }: PluginsPageModel) {
-  return (
-    selectedId ? (
+  return selectedId
+    ? portalOverlay(
+        <PluginDetailBlockingHost>
         <div className="plugins-sheet-layer">
           <button
             type="button"
@@ -173,7 +181,7 @@ export function PluginDetailSheet({
                               key={link.key}
                               type="button"
                               className="plugins-sheet-link"
-                              onClick={() => openUrlInWorkPanel(link.url)}
+                              onClick={() => openHttpUrl(link.url)}
                             >
                               <IconLink size={13} />
                               <span className="plugins-sheet-link-label">
@@ -196,7 +204,7 @@ export function PluginDetailSheet({
                           type="button"
                           className="plugins-sheet-link"
                           onClick={() =>
-                            openUrlInWorkPanel(activeVersion.provenance!.sourceRepository)
+                            openHttpUrl(activeVersion.provenance!.sourceRepository)
                           }
                         >
                           <IconLink size={13} />
@@ -274,9 +282,6 @@ export function PluginDetailSheet({
                   <section className="plugins-sheet-section">
                     <h3 className="plugins-sheet-section-title">
                       {t("plugins.versions")}
-                      <span className="plugins-sheet-section-hint">
-                        {t("plugins.selectVersion")}
-                      </span>
                     </h3>
                     <div className="plugins-version-list">
                       {(detail.versions ?? []).map((version) => {
@@ -357,7 +362,7 @@ export function PluginDetailSheet({
             )}
           </aside>
         </div>
-
-    ) : null
-  );
+        </PluginDetailBlockingHost>,
+      )
+    : null;
 }

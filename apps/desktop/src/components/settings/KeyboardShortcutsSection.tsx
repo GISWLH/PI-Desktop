@@ -96,6 +96,23 @@ export function KeyboardShortcutsSection({ settings, platform, saveSettings }: P
     } else {
       next[shortcut.id] = binding;
     }
+    const conflict = KEYBOARD_SHORTCUTS.find(
+      (candidate) =>
+        candidate.id !== shortcut.id &&
+        keybindingsConflict(
+          resolveKeybinding(candidate, settings.keybindings, platform),
+          resolveKeybinding(shortcut, next, platform),
+        ),
+    );
+    if (conflict) {
+      setError({
+        id: shortcut.id,
+        message: t("settings.shortcutConflict", {
+          action: t(shortcutLabelKey(conflict.id)),
+        }),
+      });
+      return;
+    }
     setSavingId(shortcut.id);
     setError(null);
     try {
@@ -132,23 +149,6 @@ export function KeyboardShortcutsSection({ settings, platform, saveSettings }: P
       setError({ id: shortcut.id, message: t("settings.shortcutReserved") });
       return;
     }
-    const conflict = KEYBOARD_SHORTCUTS.find(
-      (candidate) =>
-        candidate.id !== shortcut.id &&
-        keybindingsConflict(
-          resolveKeybinding(candidate, settings.keybindings, platform),
-          binding,
-        ),
-    );
-    if (conflict) {
-      setError({
-        id: shortcut.id,
-        message: t("settings.shortcutConflict", {
-          action: t(shortcutLabelKey(conflict.id)),
-        }),
-      });
-      return;
-    }
     void storeBinding(shortcut, binding);
   };
 
@@ -157,7 +157,6 @@ export function KeyboardShortcutsSection({ settings, platform, saveSettings }: P
       <div className="settings-card-heading-row">
         <div>
           <h3 className="settings-card-heading">{t("settings.keyboard")}</h3>
-          <p className="settings-card-description">{t("settings.shortcutDescription")}</p>
         </div>
         <button
           type="button"

@@ -12,14 +12,14 @@
 | Host backend | **Rust** | stable Rust toolchain | tools/plugins/permissions/persistence adapters |
 | Rust async | tokio | stable | host services |
 | Host RPC | stdio JSON-RPC (NDJSON) | frozen (D001) | Electron main ↔ Rust host |
-| Agent engine | `@earendil-works/pi-agent-core` | 0.85.1 | agent loop |
-| Model API | `@earendil-works/pi-ai` | 0.85.1 | provider adapters, OAuth, and stream handling |
-| Model catalog | `https://models.dev/api.json` | bundled release snapshot + process-local refresh | sole provider/model metadata source |
+| Agent engine | `@earendil-works/pi-agent-core` | 0.99.1 | agent loop |
+| Model API | `@earendil-works/pi-ai` | 0.99.1 | provider adapters, OAuth, and stream handling |
+| Model catalog | pi-ai Providers/Models | pinned 0.99.1 + explicit provider refresh | account-scoped metadata and typed operations |
 
-> pi-ai is not consulted for model names, capabilities, limits, modalities,
-> thinking levels, or prices. It remains the request transport dependency.
-> ChatGPT Plus/Pro and GitHub Copilot OAuth availability still comes from the
-> pinned pi-ai catalog; 0.85.1 is the first pin that lists `gpt-6-astra`.
+> pi-ai owns published metadata, native thinking support, transports and auth.
+> Host persists Desktop account rows, credentials, and explicit binding overrides.
+> pi-coding-agent remains an existing compatibility dependency for compaction and
+> file utilities; this migration does not adopt AgentSession, Codemode or routing.
 
 | Node runtime | Node.js | `>= 22.19` | pi requirement |
 | DB | SQLite | Rust host-core via `rusqlite` | sessions/settings |

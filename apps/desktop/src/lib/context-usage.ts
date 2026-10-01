@@ -1,8 +1,9 @@
 import {
   effectiveContextWindow,
-  modelIdsMatch,
+  modelWireIdsEqual,
   type ContextUsageDisplay,
   type MessageUsage,
+  type ModelBinding,
   type ModelInfo,
   type ProviderPublic,
   type ToolTokenUsage,
@@ -55,16 +56,27 @@ function providerContextWindow(provider: ProviderPublic | undefined): number | u
   return value > 0 ? value : undefined;
 }
 
+/**
+ * The saved binding for a model, reduced to the fields the window resolver
+ * needs. The provenance travels with the value, so a catalog snapshot follows
+ * models.dev while a hand-edited number stays the user's.
+ */
 function bindingContextWindow(
   provider: ProviderPublic | undefined,
   modelId: string | undefined,
-): number | undefined {
+): Pick<ModelBinding, "contextWindow" | "contextWindowSource"> | undefined {
   if (!provider || !modelId) return undefined;
   const binding = provider.models?.find((candidate) =>
-    modelIdsMatch(candidate.id, modelId),
+    candidate.id.trim().toLowerCase() === modelId.trim().toLowerCase(),
   );
-  const value = positiveTokenCount(binding?.contextWindow);
-  return value > 0 ? value : undefined;
+  if (!binding) return undefined;
+  const value = positiveTokenCount(binding.contextWindow);
+  return value > 0
+    ? {
+        contextWindow: value,
+        contextWindowSource: binding.contextWindowSource,
+      }
+    : undefined;
 }
 
 export function resolveContextWindow(
@@ -76,19 +88,24 @@ export function resolveContextWindow(
   const provider = providers.find((candidate) => candidate.id === providerId);
   const catalogModel = modelId
     ? providerId
-      ? providerModels[providerId]?.find((model) => modelIdsMatch(model.modelId, modelId))
+      ? providerModels[providerId]?.find((model) => modelWireIdsEqual(model.modelId, modelId))
       : Object.values(providerModels)
           .flat()
-          .find((model) => modelIdsMatch(model.modelId, modelId))
+          .find((model) => modelWireIdsEqual(model.modelId, modelId))
     : undefined;
   const catalogWindow = modelContextWindow(catalogModel);
+  const configured = bindingContextWindow(provider, modelId);
   const configuredWindow = effectiveContextWindow(
     catalogWindow,
-    bindingContextWindow(provider, modelId),
+    configured?.contextWindow,
+    configured?.contextWindowSource,
   );
   if (configuredWindow) return configuredWindow;
 
-  const providerWindow = providerContextWindow(provider);
+  // An enriched provider window may describe a different configured model.
+  const providerWindow = !modelId || !provider?.models?.length
+    ? providerContextWindow(provider)
+    : undefined;
   return providerWindow ?? DEFAULT_CONTEXT_WINDOW;
 }
 

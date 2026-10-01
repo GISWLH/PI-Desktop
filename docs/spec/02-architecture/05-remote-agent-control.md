@@ -154,7 +154,11 @@ PI-Desktop (Remote Client)                    Remote machine
 
 Bootstrap runs over the user's own SSH session, never over RACP:
 
-1. The desktop opens SSH with the user's existing configuration and keys.
+1. The desktop opens SSH with the user's existing configuration and keys. A
+   login password MAY be supplied instead of a key (ADR 0293): it is handed to
+   the `ssh` client through an askpass helper, never as an argument, and is
+   stored encrypted in the desktop's secure storage so the host can reconnect
+   after a restart.
 2. It uploads a small bootstrap script that downloads the `pi-host` bundle
    for the remote platform at the desktop's version from GitHub Releases,
    verifies the published SHA-256, and installs it under the user's home. A
@@ -398,10 +402,10 @@ transition that outlives the submitting turn. A remote client cannot select
 an unadvertised permission mode or execute a tool directly; changing a
 durable mode uses `session/configure` from the remote-host profile and is
 idle-only, exactly as locally. A Gateway-routed turn never exceeds the Host's
-remote permission ceiling. Approval lifetime is Host policy: the local
-default stays 120 seconds then deny, and while a remote subscriber is
-attached the default is 30 minutes (D375), bounded and operator-adjustable,
-because a remote approver is rarely at the keyboard.
+remote permission ceiling. Local desktop permission approvals have no
+automatic deadline. While a remote subscriber is attached, the remote approval
+record defaults to 30 minutes (D375), bounded and operator-adjustable, because
+a remote approver is rarely at the keyboard.
 
 ## 10. Failure and recovery model
 

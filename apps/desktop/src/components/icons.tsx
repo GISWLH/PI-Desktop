@@ -9,6 +9,7 @@ import {
   ArrowUpDown,
   ArrowUpRight,
   AtSign,
+  AudioLines,
   Bell,
   BookOpen,
   Bot,
@@ -18,6 +19,7 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   CircleAlert,
   CircleCheck,
   CircleHelp,
@@ -30,6 +32,8 @@ import {
   Copy,
   Dot,
   ExternalLink,
+  Eye,
+  EyeOff,
   FileDiff,
   FileSpreadsheet,
   FileText,
@@ -48,6 +52,7 @@ import {
   ListChecks,
   LogOut,
   Mic,
+  MicOff,
   Minus,
   MessageSquare,
   MessageSquarePlus,
@@ -62,6 +67,7 @@ import {
   Maximize2,
   Minimize2,
   PawPrint,
+  PhoneOff,
   PencilLine,
   Pin,
   Play,
@@ -84,12 +90,13 @@ import {
   Sun,
   Target,
   Terminal,
-  TextQuote,
+  TextSelect,
   Trash2,
   TriangleAlert,
   UserRound,
   Undo2,
   Video,
+  Volume2,
   Webhook,
   Workflow,
   Wrench,
@@ -152,8 +159,6 @@ export const IconArrowUpDown = icon(ArrowUpDown);
 export const IconSearch = icon(Search);
 export const IconRefresh = icon(RefreshCcw);
 export const IconChat = icon(MessageSquare);
-/** Message reference: quote part of a message into the composer (D-LOCAL-message-quotes). */
-export const IconQuote = icon(TextQuote);
 /** Session creation affordance. Keep it distinct from generic add actions. */
 export const IconNewSession = icon(MessageSquarePlus);
 export const IconFolder = icon(Folder);
@@ -180,6 +185,8 @@ export const IconSidebar = icon(PanelLeft);
 export const IconArrowUp = icon(ArrowUp);
 export const IconArrowDown = icon(ArrowDown);
 export const IconCopy = icon(Copy);
+/* Chat context menus: hand a message's rendered text to the platform selection. */
+export const IconTextSelect = icon(TextSelect);
 export const IconCode = icon(Code2);
 export const IconDatabase = icon(Database);
 export const IconCheck = icon(Check);
@@ -195,9 +202,10 @@ export const IconSquare = icon(Square);
 export const IconSliders = icon(SlidersHorizontal);
 export const IconConfig = icon(RefreshCcw);
 export const IconChevronLeft = icon(ChevronLeft);
-export const IconChevronRight = icon(ChevronRight);
 export const IconExternal = icon(ExternalLink);
 export const IconArrowUpRight = icon(ArrowUpRight);
+export const IconChevronRight = icon(ChevronRight);
+export const IconChevronUp = icon(ChevronUp);
 export const IconUndo2 = icon(Undo2);
 export const IconCloudDown = icon(CloudDownload);
 export const IconDownload = icon(Download);
@@ -210,6 +218,10 @@ export const IconVideo = icon(Video);
 export const IconReview = icon(RefreshCw);
 export const IconKeyboard = icon(Keyboard);
 export const IconMic = icon(Mic);
+export const IconMicOff = icon(MicOff);
+export const IconWaveform = icon(AudioLines);
+export const IconPhoneOff = icon(PhoneOff);
+export const IconVolume = icon(Volume2);
 export const IconPlug = icon(Plug);
 export const IconSlash = icon(Slash);
 export const IconUser = icon(UserRound);
@@ -243,6 +255,9 @@ export const IconStar = icon(Star);
 export const IconCircleCheck = icon(CircleCheck);
 export const IconCircleAlert = icon(CircleAlert);
 export const IconTriangleAlert = icon(TriangleAlert);
+/* Password field reveal toggle (see PasswordInput). */
+export const IconEye = icon(Eye);
+export const IconEyeOff = icon(EyeOff);
 
 export function IconStop({ size = 16, style, ...props }: IconProps) {
   return (

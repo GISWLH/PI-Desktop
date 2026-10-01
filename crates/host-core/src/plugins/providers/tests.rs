@@ -89,14 +89,16 @@ fn declaration_manifest(providers: Value, permissions: Value) -> Value {
 }
 
 #[test]
-fn schema_is_v17_with_the_owner_column() {
+fn a_new_database_carries_the_owner_column_at_the_current_schema_version() {
     let (_dir, db, _secrets) = test_context();
-    assert_eq!(SCHEMA_VERSION, 17);
+    // v17 added the owner column, v18 the turn-queue priority column, v19 session omit, and v21 the session Todo checklist; a fresh
+    // database is stamped with the newest, so the column set is the current one.
+    assert_eq!(SCHEMA_VERSION, 21);
     let version: i64 = db
         .conn()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, SCHEMA_VERSION);
     let has_owner: bool = db
         .conn()
         .query_row(
@@ -174,6 +176,118 @@ fn sync_is_declarative_and_drops_a_removed_declaration() {
             .is_none()
     );
     assert!(!secrets.has(&key_ref));
+}
+
+/// A declaration that stops naming a model forgets the row cached for it, the
+/// same way a user save does: the cache must not keep describing a model this
+/// provider no longer declares.
+#[test]
+fn dropping_a_declared_model_forgets_its_cached_row() {
+    let (_dir, db, secrets) = test_context();
+    let declared = declared_providers(&manifest());
+    sync_plugin_providers(&db, &secrets, "demo.provider", &declared, true).unwrap();
+    let row_id = "plugin:demo.provider:demo";
+    providers::cache_discovered_models(
+        &db,
+        row_id,
+        &[
+            providers::DiscoveredModelInput {
+                model_id: "demo-large".into(),
+                display_name: "Demo Large".into(),
+                capabilities: vec!["text".into()],
+                context_window: Some(200_000),
+            },
+            providers::DiscoveredModelInput {
+                model_id: "demo-small".into(),
+                display_name: "Demo Small".into(),
+                capabilities: vec!["text".into()],
+                context_window: Some(32_000),
+            },
+            providers::DiscoveredModelInput {
+                model_id: "demo-extra".into(),
+                display_name: "Demo Extra".into(),
+                capabilities: vec!["text".into()],
+                context_window: None,
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(providers::list_models(&db, Some(row_id)).unwrap().len(), 3);
+
+    let mut value = serde_json::to_value(manifest()).unwrap();
+    value["contributes"]["providers"][0]["models"] = json!([{
+        "id": "demo-large",
+        "name": "Demo Large",
+        "contextWindow": 200000,
+        "maxTokens": 8192
+    }]);
+    let shrunk: PluginManifest = serde_json::from_value(value).unwrap();
+    sync_plugin_providers(
+        &db,
+        &secrets,
+        "demo.provider",
+        &declared_providers(&shrunk),
+        true,
+    )
+    .unwrap();
+
+    let mut cached: Vec<String> = providers::list_models(&db, Some(row_id))
+        .unwrap()
+        .into_iter()
+        .map(|model| model.model_id)
+        .collect();
+    cached.sort();
+    assert_eq!(cached, vec!["demo-extra", "demo-large"]);
+}
+
+/// A declaration that moves its endpoint abandons the discovery answer the
+/// previous one produced: those rows describe a service this provider no longer
+/// points at.
+#[test]
+fn moving_a_declared_endpoint_forgets_the_discovered_answer() {
+    let (_dir, db, secrets) = test_context();
+    let declared = declared_providers(&manifest());
+    sync_plugin_providers(&db, &secrets, "demo.provider", &declared, true).unwrap();
+    let row_id = "plugin:demo.provider:demo";
+    providers::cache_discovered_models(
+        &db,
+        row_id,
+        &[
+            providers::DiscoveredModelInput {
+                model_id: "demo-large".into(),
+                display_name: "Demo Large".into(),
+                capabilities: vec!["text".into()],
+                context_window: Some(200_000),
+            },
+            providers::DiscoveredModelInput {
+                model_id: "demo-remote-only".into(),
+                display_name: "Demo Remote Only".into(),
+                capabilities: vec!["text".into()],
+                context_window: Some(8_000),
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(providers::list_models(&db, Some(row_id)).unwrap().len(), 2);
+
+    let mut value = serde_json::to_value(manifest()).unwrap();
+    value["contributes"]["providers"][0]["baseUrl"] = json!("https://mirror.example.com/v1");
+    let moved: PluginManifest = serde_json::from_value(value).unwrap();
+    sync_plugin_providers(
+        &db,
+        &secrets,
+        "demo.provider",
+        &declared_providers(&moved),
+        true,
+    )
+    .unwrap();
+
+    let cached: Vec<String> = providers::list_models(&db, Some(row_id))
+        .unwrap()
+        .into_iter()
+        .map(|model| model.model_id)
+        .collect();
+    assert_eq!(cached, vec!["demo-large"]);
 }
 
 #[test]
@@ -487,7 +601,7 @@ fn startup_reconciliation_removes_a_row_whose_plugin_is_gone() {
     secrets.set(&key_ref, "sk-demo").unwrap();
     // No plugin is registered in this data directory, so the row has no owner
     // to answer for it.
-    let plugins = PluginManager::new(dir.path(), None);
+    let plugins = PluginManager::new(dir.path(), MarketChannel::Official, None);
     assert_eq!(
         crate::plugins::reconcile_all(&db, &secrets, &plugins).unwrap(),
         1
@@ -592,4 +706,85 @@ fn dropping_the_api_key_auth_kind_clears_the_stored_key() {
     assert!(providers::get_secret_for_provider(&db, &secrets, id)
         .unwrap()
         .is_none());
+}
+
+/// A manifest whose first model declares a reasoning menu.
+fn manifest_with_thinking_levels() -> PluginManifest {
+    let mut value = serde_json::to_value(manifest()).unwrap();
+    value["contributes"]["providers"][0]["models"][0]["thinkingLevels"] =
+        json!(["off", "low", "high"]);
+    value["contributes"]["providers"][0]["models"][0]["defaultThinkingLevel"] = json!("high");
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn declared_thinking_levels_survive_into_the_row() {
+    let (_dir, db, secrets) = test_context();
+    let declared = declared_providers(&manifest_with_thinking_levels());
+    assert_eq!(
+        declared[0].models[0].thinking_levels,
+        ["off", "low", "high"]
+    );
+    assert_eq!(
+        declared[0].models[0].default_thinking_level.as_deref(),
+        Some("high")
+    );
+    // The second model declares nothing, so it keeps offering no menu.
+    assert!(declared[0].models[1].thinking_levels.is_empty());
+    assert!(declared[0].models[1].default_thinking_level.is_none());
+
+    sync_plugin_providers(&db, &secrets, "demo.provider", &declared, true).unwrap();
+    let row = &providers::list_providers(&db, &secrets, true).unwrap()[0];
+    assert_eq!(row.models[0].thinking_levels, ["off", "low", "high"]);
+    assert_eq!(
+        row.models[0].default_thinking_level.as_deref(),
+        Some("high")
+    );
+}
+
+#[test]
+fn declared_thinking_levels_are_normalized() {
+    let mut value = serde_json::to_value(manifest()).unwrap();
+    // "ultra" is not a canonical level and "low" repeats, so the stored list
+    // must come back canonical and deduplicated rather than as declared.
+    value["contributes"]["providers"][0]["models"][0]["thinkingLevels"] =
+        json!(["low", "ultra", "low", "  high  ", 7]);
+    let manifest: PluginManifest = serde_json::from_value(value).unwrap();
+    let declared = declared_providers(&manifest);
+    assert_eq!(declared[0].models[0].thinking_levels, ["low", "high"]);
+}
+
+#[test]
+fn a_default_outside_the_declared_list_is_dropped() {
+    let mut value = serde_json::to_value(manifest_with_thinking_levels()).unwrap();
+    // Naming a level the model does not offer must not be stored: the runtime
+    // would silently open on a different one while the row claimed otherwise.
+    value["contributes"]["providers"][0]["models"][0]["defaultThinkingLevel"] = json!("max");
+    let manifest: PluginManifest = serde_json::from_value(value).unwrap();
+    let declared = declared_providers(&manifest);
+    assert_eq!(
+        declared[0].models[0].thinking_levels,
+        ["off", "low", "high"]
+    );
+    assert!(declared[0].models[0].default_thinking_level.is_none());
+}
+
+#[test]
+fn malformed_thinking_level_fields_are_rejected_by_manifest_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plugin");
+    let mut value = serde_json::to_value(manifest()).unwrap();
+
+    value["contributes"]["providers"][0]["models"][0]["thinkingLevels"] = json!("high");
+    write_plugin(&root, value.clone());
+    assert!(read_manifest_err(&root).contains("thinkingLevels must be an array of strings"));
+
+    value["contributes"]["providers"][0]["models"][0]["thinkingLevels"] = json!(["high", 7]);
+    write_plugin(&root, value.clone());
+    assert!(read_manifest_err(&root).contains("thinkingLevels must be an array of strings"));
+
+    value["contributes"]["providers"][0]["models"][0]["thinkingLevels"] = json!(["high"]);
+    value["contributes"]["providers"][0]["models"][0]["defaultThinkingLevel"] = json!(7);
+    write_plugin(&root, value);
+    assert!(read_manifest_err(&root).contains("defaultThinkingLevel must be a string"));
 }

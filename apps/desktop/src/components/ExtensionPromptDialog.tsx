@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import type { TrustedExtensionUiPrompt } from "@pi-desktop/shared";
 import { api } from "../lib/api";
+import { useHostSafetySurface } from "../lib/host-safety-layer";
 import { useAppStore } from "../stores/app-store";
 import { Button, TooltipButton } from "./ui";
 import { IconClose, IconPlug } from "./icons";
@@ -21,6 +22,10 @@ export function ExtensionPromptHost() {
 
   useEffect(() => {
     const offPrompt = api.onExtensionPrompt((prompt) => {
+      if (prompt.cancelled) {
+        setQueue((prev) => prev.filter((item) => item.promptId !== prompt.promptId));
+        return;
+      }
       setQueue((prev) => (prev.some((p) => p.promptId === prompt.promptId) ? prev : [...prev, prompt]));
     });
     const offStatus = api.onExtensionStatus((event) => {
@@ -80,6 +85,8 @@ function ExtensionPromptDialog({
   );
   const inputRef = useRef<HTMLInputElement | null>(null);
   const dialogId = `extension-prompt-${prompt.promptId}`;
+  // Plugin layers step aside while the user answers.
+  useHostSafetySurface();
 
   useEffect(() => {
     const previousOverflow = document.body.style.overflow;
@@ -127,7 +134,7 @@ function ExtensionPromptDialog({
         onClick={(event) => event.stopPropagation()}
       >
         <div className="session-rename-dialog-head">
-          <div>
+          <div className="session-rename-dialog-heading">
             <h2 id={`${dialogId}-title`} className="session-rename-dialog-title">
               <IconPlug size={16} aria-hidden />
               {title}

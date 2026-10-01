@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createAssistantMessageEventStream,
   type AssistantMessage,
@@ -241,12 +241,46 @@ describe("completeOneShot OpenCode headers", () => {
       },
     );
     expect(result.text).toBe("ok");
+    expect(result.usage).toMatchObject({ operationId: expect.any(String), providerId: provider.id, modelId: provider.modelId });
     expect(captured?.sessionId).toBe("session-9");
     expect(captured?.headers).toMatchObject({
       [OPENCODE_SESSION_HEADER]: "session-9",
       [OPENCODE_CLIENT_HEADER]: OPENCODE_CLIENT_VALUE,
       "User-Agent": OPENCODE_USER_AGENT,
     });
+  });
+
+  it("honors a caller output-token ceiling without changing the default budget", async () => {
+    const capturedBudgets: number[] = [];
+    await completeOneShot(provider, { systemPrompt: "s", messages: [] }, "off", {
+      maxOutputTokens: 256,
+      stream: (_model, _context, options) => {
+        if (options?.maxTokens !== undefined) capturedBudgets.push(options.maxTokens);
+        return streamFor(assistantOk());
+      },
+    });
+    expect(capturedBudgets[0]).toBe(256);
+
+    await completeOneShot(provider, { systemPrompt: "s", messages: [] }, "off", {
+      stream: (_model, _context, options) => {
+        if (options?.maxTokens !== undefined) capturedBudgets.push(options.maxTokens);
+        return streamFor(assistantOk());
+      },
+    });
+    expect(capturedBudgets[1]).toBeGreaterThan(256);
+  });
+
+  it("forwards caller cancellation to the provider stream", async () => {
+    const controller = new AbortController();
+    let captured: SimpleStreamOptions | undefined;
+    await completeOneShot(provider, { systemPrompt: "s", messages: [] }, "off", {
+      signal: controller.signal,
+      stream: (_model, _context, options) => {
+        captured = options;
+        return streamFor(assistantOk());
+      },
+    });
+    expect(captured?.signal).toBe(controller.signal);
   });
 
   it("does not attach OpenCode headers to a generic Completions provider", async () => {
@@ -270,6 +304,58 @@ describe("completeOneShot OpenCode headers", () => {
     );
     expect(captured?.sessionId).toBe("session-9");
     expect(captured?.headers?.[OPENCODE_SESSION_HEADER]).toBeUndefined();
+  });
+
+  it("keeps a certificate rejection terminal in one-shot completions", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(
+      Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("certificate rejected"), {
+          code: "SELF_SIGNED_CERT_IN_CHAIN",
+        }),
+      }),
+    );
+    let attempts = 0;
+    try {
+      await expect(
+        completeOneShot(
+          provider,
+          { systemPrompt: "s", messages: [] },
+          "off",
+          {
+            stream: (_model, _context, options) => {
+              attempts += 1;
+              const stream = createAssistantMessageEventStream();
+              const failed = {
+                ...assistantOk(),
+                content: [],
+                stopReason: "error" as const,
+                errorMessage: "fetch failed",
+              };
+              void options?.fetch?.("https://provider.invalid", {}).then(
+                () => {
+                  stream.push({ type: "error", reason: "error", error: failed });
+                  stream.end(failed);
+                },
+                () => {
+                  stream.push({ type: "error", reason: "error", error: failed });
+                  stream.end(failed);
+                },
+              );
+              return stream;
+            },
+          },
+        ),
+      ).rejects.toMatchObject({
+        errorCode: "NETWORK_ERROR",
+        data: {
+          networkCode: "SELF_SIGNED_CERT_IN_CHAIN",
+          retriable: false,
+        },
+      });
+      expect(attempts).toBe(1);
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });
 

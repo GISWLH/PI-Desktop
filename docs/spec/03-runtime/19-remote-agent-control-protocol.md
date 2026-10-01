@@ -265,6 +265,9 @@ Queued turns and their idempotency keys are persisted by Rust host-core
 (D375), so a Host restart restores the queue in order. A restored queue is
 held; release resumes on the first controller attach, local or remote, so a
 reboot never starts work unattended.
+Runtime events received before a queued start is acknowledged belong to the
+dequeued turn being started. They must not change the next waiting entry's
+status or prevent that entry from being canceled.
 `canceled` is the terminal state of a queued turn that never started;
 `interrupted` is the terminal state of a started turn that was stopped or
 aborted. Terminal turns are immutable.
@@ -485,8 +488,9 @@ Rules:
    is the local `AskToolResolution` contract.
 4. Approval summaries MUST be safe to display. Raw provider credentials,
    secret values, and unbounded tool results are never included.
-5. Expiry maps the local `PERMISSION_TIMEOUT` and `PLAN_APPROVAL_TIMEOUT`
-   outcomes to `APPROVAL_EXPIRED`; the tool is never executed after expiry.
+5. Expiry maps a legacy `PERMISSION_TIMEOUT` from an older local host, and
+   `PLAN_APPROVAL_TIMEOUT`, to `APPROVAL_EXPIRED`; the tool is never executed
+   after expiry. Current local permission prompts do not expire.
 
 ### 5.6 Attachment
 
@@ -591,6 +595,9 @@ session root as working directory and stream through `terminal.output`.
 | `terminal/input` | controller | Write bytes to an open terminal |
 | `terminal/resize` | controller | Resize an open terminal |
 | `terminal/close` | controller | Close a terminal; idempotent |
+| `connection/pair` | authenticated | Exchange the single-use pairing token presented on the upgrade for a device credential (security §3.4); only valid on a pairing connection (D448) |
+| `project/register` | owner | Register a Host directory as a project: the Host canonicalizes and validates the path and returns the project id (D448) |
+| `project/browse` | owner | List directories under a Host path, bounded, for the remote folder picker (D448) |
 
 ### 6.3 Deferred operations
 
@@ -1126,7 +1133,7 @@ The initial target limits are:
 | `connection/initialize` deadline | 10 seconds |
 | Read/metadata operation deadline | 15 seconds |
 | `turn/start` admission deadline | 5 seconds |
-| Approval lifetime, local default | 120 seconds, then deny |
+| Approval lifetime, local default | No automatic deadline; explicit decision or cancellation |
 | Approval lifetime, remote policy | 30 minutes by default while a remote subscriber is attached; Host-configured, bounded, advertised as `approvalLifetimeMs` |
 | Heartbeat interval | 30 seconds |
 | Terminal output replay ring | 128 KiB per terminal |
@@ -1136,12 +1143,12 @@ The initial target limits are:
 The Host MAY advertise stricter limits. It MUST return a structured limit
 error rather than truncating a command silently.
 
-Approval lifetime is a Host policy. The local default stays at 120 seconds
-then deny (frozen decision 17). While a remote subscriber is attached the
-default lifetime is 30 minutes (D375), because a remote approver is rarely at
-the keyboard; the Host operator may shorten or lengthen it within a bound, the
-tool call stays blocked for that lifetime unless a local or remote decision
-arrives earlier, and a disconnect never extends it.
+Approval lifetime is a Host policy. Local desktop permission requests have no
+automatic deadline and remain pending until an explicit decision, cancellation,
+or shutdown. While a remote subscriber is attached, the remote approval record
+has a 30-minute default lifetime (D375), because a remote approver is rarely at
+the keyboard; the Host operator may shorten or lengthen it within a bound, and
+a disconnect never extends it.
 
 ## 13. Errors
 
@@ -1177,6 +1184,11 @@ Initial RACP codes are:
 | `APPROVAL_STALE` | no | Approval response targets an old revision |
 | `PAYLOAD_TOO_LARGE` | no | Request, event, or attachment exceeds a limit |
 | `RATE_LIMITED` | yes | Principal, session, or host quota exceeded |
+| `PAIRING_FAILED` | no | The pairing token is unknown or was already exchanged |
+| `PAIRING_TOKEN_EXPIRED` | no | The pairing token's bootstrap window passed |
+| `CAPABILITY_UNAVAILABLE` | no | The Host does not advertise the capability the operation needs |
+| `REMOTE_PATH_NOT_FOUND` | no | A Host-side path does not exist |
+| `REMOTE_PATH_FORBIDDEN` | no | A Host-side path is outside what the principal may reach |
 | `INTERNAL` | maybe | Unexpected failure with a trace id |
 
 Implementations MUST map these codes into the shared `AppError` vocabulary
@@ -1207,6 +1219,33 @@ thing across all bindings.
    and host restart recovery.
 8. The client treats a new major protocol version as incompatible unless an
    explicit compatibility adapter is selected.
+
+## 14a. RACP-WS binding implementation notes (D448)
+
+`packages/racp` is the reference implementation of the `RACP-WS` binding.
+Beyond the rules above it fixes these wire details:
+
+- `connection/initialize` answers with `server.hostId`, the Host's stable
+  identity minted at first start; a client keys its Host records by it, never
+  by hostname, address, or path.
+- The client sends `notifications/initialized` after the initialization
+  result; the Host closes a connection that has not initialized within the
+  §12 deadline.
+- A JSON-RPC error carries the `RemoteError` under `error.data`; the numeric
+  `error.code` is `-32601` for `METHOD_NOT_FOUND`, `-32602` for
+  `INVALID_ARGUMENT`, and `-32000` otherwise.
+- When the Host closes one subscription (`CLIENT_TOO_SLOW`) it sends the
+  `events/closed` notification with the subscription id, the `RemoteError`,
+  and the last safely delivered cursor; the connection stays open.
+- Terminal events are connection-local and are never entered into the
+  session's durable log; their `epoch` is the session's and
+  `terminal.changed` carries the current sequence without allocating one.
+- Device tokens are `pdt1.`-prefixed and pairing tokens `ppt1.`-prefixed;
+  both are presented as `Authorization: Bearer` on the upgrade, stored
+  hashed (SHA-256) on the Host, and never accepted from a URL.
+- Reconnect never re-sends an in-flight request: the pending calls of the
+  dropped connection fail with `HOST_DISCONNECTED`, and a caller that retries
+  presents the same idempotency key.
 
 ## 15. Amendment history
 
@@ -1246,4 +1285,3 @@ D375 (2026-09-10) re-sequenced the deployments and extended the catalog:
 - queued turns persisted by host-core and held after a restart, the
   30-minute default approval lifetime for remote subscribers, and the
   `applyCeilingToPairedDevices` policy.
-

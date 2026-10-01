@@ -2,6 +2,117 @@ import type { ChangelogEntry } from "./changelog.js";
 
 export const frEntries: ChangelogEntry[] = [
   {
+    "version": "0.16.0",
+    "date": "2026-10-01",
+    "highlights": [
+      "Live Voice est désormais accessible à tous et les appels démarrent dans la conversation en cours.",
+      "Nouvelle liste de tâches par conversation, qui conserve son état de référence même après un redémarrage du service local.",
+      "Les notifications ponctuelles s’affichent maintenant dans la pile de toasts commune plutôt que dans des boîtes de dialogue bloquantes.",
+      "Les listes de modèles suivent les métadonnées officielles des fournisseurs, ce qui garde les services relais et les noms de modèles exacts.",
+    ],
+  },
+
+  {
+    "version": "0.15.10",
+    "date": "2026-09-28",
+    "highlights": [
+      "Les plugins de la marketplace s’affichent désormais dans un ordre aléatoire plutôt que par ordre alphabétique.",
+    ],
+  },
+
+  {
+    "version": "0.15.9",
+    "date": "2026-09-27",
+    "highlights": [
+      "Supprime les anciens fichiers d'aide au premier démarrage des paquets macOS DMG et ZIP.",
+    ],
+  },
+
+  {
+    "version": "0.15.6",
+    "date": "2026-09-23",
+    "highlights": [
+      "Activez la recherche native dans vos services DeepSeek, xAI et OpenAI existants sans modifier leurs paramètres de connexion.",
+      "Prend en charge GPT-6 Astra, Sol et Luna dans les catalogues de modèles OpenAI et ChatGPT/Codex.",
+    ],
+  },
+
+  {
+    "version": "0.15.5",
+    "date": "2026-09-23",
+    "highlights": [
+      "Prend en charge GPT-6 Astra, Sol et Luna dans les catalogues de modèles OpenAI et ChatGPT/Codex.",
+    ],
+  },
+
+  {
+    "version": "0.15.2",
+    "date": "2026-09-21",
+    "highlights": [
+      "Générez et modifiez des images dans le chat, choisissez un modèle et créez des lots avec la compétence intégrée imagegen.",
+      "L'activité des outils suit la largeur de la conversation et contient proprement les libellés longs.",
+      "Les pièces jointes collées sont conservées même si le collage se termine après un changement de session.",
+      "Le modèle par défaut sélectionné est conservé lors de la modification des fournisseurs, avec un repli sûr s'il est supprimé.",
+      "Les sections imbriquées de réflexion et d'activité des outils sont plus faciles à lire, parcourir et restaurer.",
+      "Améliore les mises en page du Composer, les contrôles de raisonnement et la cohérence des thèmes de l'espace de travail.",
+      "Ajoute un interrupteur optionnel dans Réglages pour réessayer les erreurs réseau et temporaires jusqu’à réussite.",
+    ],
+  },
+
+  {
+    "version": "0.15.1",
+    "date": "2026-09-19",
+    "highlights": [
+      "Appariez et gérez des hôtes distants en SSH depuis les Réglages, avec mot de passe, installation et reconnexion au lancement.",
+      "Configurez l'amélioration de prompt (gabarit, modèle et raisonnement) depuis la carte Réglages IA.",
+      "Réordonnez les modèles sélectionnés par glisser-déposer, et ajoutez un niveau « omettre la réflexion » sans surcharge fournisseur.",
+      "Redimensionnez ou réduisez la barre latérale, et rétablissez la largeur par défaut d'une barre ou d'un panneau d'un double-clic.",
+      "Gérez les projets dans une archive groupée avec inspecteur, et importez chaque type depuis son propre établi.",
+      "Analysez et importez en lot les skills et serveurs MCP d'autres outils d'agent.",
+      "L'extra de la barre de menus macOS reste sur un status item natif, avec des raccourcis de session limités dans le plateau.",
+      "Les builds macOS officiels sont signés, notariés, et gèrent les mises à jour in-app.",
+      "La DMG macOS signée s'installe en deux icônes ; la note d'ouverture non signée reste uniquement dans le ZIP.",
+      "Review ne s'ouvre que sur action explicite, et l'ouverture d'une session atterrit sur le dernier tour.",
+      "Une file d'envoi bloquée se rétablit, et les origines de steering falsifiées sont ignorées.",
+    ],
+  },
+
+  {
+    "version": "0.15.0",
+    "date": "2026-09-17",
+    "highlights": [
+      "Réordonnez, modifiez, verrouillez et promouvez les prompts en file pour qu'un message plus tardif parte ensuite.",
+      "Clonez un dépôt git depuis la boîte de dialogue de création de projet.",
+      "Faites glisser la largeur du contenu de conversation dans la colonne de chat.",
+      "Les échecs d'installation du marché des skills affichent un nouvel essai au lieu d'un bouton mort.",
+      "Les fournisseurs déclarés par un plugin apparaissent comme des lignes natives, avec clés API et agents personnalisés de confiance.",
+      "Les plugins peuvent demander des connexions temps réel, des raccourcis globaux, des permissions de capacité, et un canal officiel avec sauvegardes.",
+      "Les plugins peuvent enregistrer des variables de thème, des ressources de thème et un widget flottant transparent.",
+      "Supprime un projet avec les sessions qui lui appartiennent, après une seconde confirmation.",
+      "Les sous-agents disposent d'une liste ordonnée de modèles de repli ; un sous-agent terminé reprend depuis la même carte Task ; les builtins se basculent dans les Réglages.",
+      "Les références de fichiers des lignes d'outils ouvrent la vue ; déplier conserve la lecture ; le survol Plan est une plaque opaque.",
+    ],
+  },
+
+  {
+    "version": "0.14.9",
+    "date": "2026-09-17",
+    "highlights": [
+      "Réordonnez, modifiez, verrouillez et promouvez les prompts en file pour qu'un message plus tardif parte ensuite.",
+      "Clonez un dépôt git depuis la boîte de dialogue de création de projet.",
+      "Faites glisser la largeur du contenu de conversation dans la colonne de chat.",
+      "Les échecs d'installation du marché des skills affichent un nouvel essai au lieu d'un bouton mort.",
+      "Les fournisseurs déclarés par un plugin apparaissent comme des lignes natives, avec clés API et agents personnalisés de confiance.",
+      "Les plugins peuvent demander des connexions temps réel, des raccourcis globaux, des permissions de capacité, et un canal officiel avec sauvegardes.",
+      "Les plugins peuvent enregistrer des variables de thème, des ressources de thème et un widget flottant transparent.",
+      "Supprime un projet avec les sessions qui lui appartiennent, après une seconde confirmation.",
+      "Les sous-agents disposent d'une liste ordonnée de modèles de repli ; les builtins livrés se basculent dans les Réglages.",
+      "Les références de fichiers des lignes d'outils ouvrent la vue ; déplier conserve la lecture ; le survol Plan est une plaque opaque.",
+    ],
+  },
+
+
+  {
     "version": "0.14.8",
     "date": "2026-09-14",
     "highlights": [

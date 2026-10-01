@@ -116,11 +116,26 @@ describe("NativePiSessionService", () => {
     const lease = acquireNativePiSessionLease(f.file);
     const manager = SessionManager.open(f.file);
     guardNativePiSessionManager(manager, lease);
-    manager.appendMessage({ role: "user", content: [{ type: "text", text: "desktop turn" }], timestamp: Date.now() });
+    const userEntryId = manager.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "desktop turn" }],
+      timestamp: Date.now(),
+    });
+    manager.appendContextEdit(userEntryId, {
+      content: [{ type: "text", text: "edited model context" }],
+    });
+    expect(manager.buildSessionContext().messages).toContainEqual({
+      role: "user",
+      content: [{ type: "text", text: "edited model context" }],
+      timestamp: expect.any(Number),
+    });
     const afterOwnAppend = readFileSync(f.file, "utf8");
     expect(afterOwnAppend).toContain("desktop turn");
+    expect(afterOwnAppend).toContain('"type":"context_edit"');
     writeFileSync(f.file, `${afterOwnAppend}${JSON.stringify({ type: "custom", id: "foreign", parentId: manager.getLeafId(), timestamp: new Date().toISOString(), customType: "foreign" })}\n`);
-    expect(() => manager.appendMessage({ role: "user", content: [{ type: "text", text: "must not write" }], timestamp: Date.now() })).toThrow(/changed/i);
+    expect(() => manager.appendContextEdit(userEntryId, {
+      content: [{ type: "text", text: "must not write" }],
+    })).toThrow(/changed/i);
     expect(readFileSync(f.file, "utf8")).not.toContain("must not write");
     lease.release();
   });
@@ -267,9 +282,13 @@ describe("native continuation review regressions", () => {
     const service = new NativePiSessionService(f);
     try {
       const [summary] = await service.list();
-      await service.prompt(summary.id, "same prompt", (e) => events.push(e), "optimistic-1");
+      const accepted = await service.prompt(summary.id, "same prompt", (e) => events.push(e), "optimistic-1");
       await expect.poll(() => calls).toBe(2);
       expect(events.filter((e) => e.event.type === "agent_end")).toHaveLength(0);
+      expect(service.status(summary.id).status).toMatchObject({ isRunning: true, currentTurnId: accepted.turnId });
+      const staleAbort = await Reflect.apply(service.abort, service, [summary.id, "different-turn"]);
+      expect(staleAbort).toEqual({ ok: false });
+      expect(service.status(summary.id).status.currentTurnId).toBe(accepted.turnId);
       expect(service.status(summary.id).status.isRunning).toBe(true);
       expect(service.detail(summary.id)?.capabilities).toMatchObject({ canPrompt: false, canStop: true });
       await expect(service.prompt(summary.id, "overlap", () => {})).rejects.toMatchObject({ errorCode: "AGENT_BUSY" });
@@ -327,7 +346,12 @@ describe("native continuation review regressions", () => {
     }`);
     const requests: { systemPrompt?: string; tools: unknown[]; messages: unknown }[] = [];
     vi.spyOn(ModelRuntime.prototype, "streamSimple").mockImplementation((_model, context) => {
-      requests.push({ systemPrompt: context.systemPrompt, tools: context.tools ?? [], messages: context.messages });
+      const systemMessage = context.messages.find((message) => message.role === "system");
+      requests.push({
+        systemPrompt: typeof systemMessage?.content === "string" ? systemMessage.content : undefined,
+        tools: context.tools ?? [],
+        messages: context.messages,
+      });
       return fauxStream();
     });
     const service = new NativePiSessionService(f);
@@ -384,7 +408,7 @@ describe("native continuation review regressions", () => {
 });
 
 
-describe("native side-chat forks", () => {
+describe("native fork children", () => {
   function forkFixture() {
     const root = mkdtempSync(join(tmpdir(), "pi-desktop-native-fork-"));
     roots.push(root);
@@ -441,7 +465,7 @@ describe("native side-chat forks", () => {
       const [summary] = await service.list();
       const parentBytes = readFileSync(f.file, "utf8");
       const before = groupEntries(f.group);
-      const child = service.fork({ id: summary.id, title: "Side chat: hello" });
+      const child = service.fork({ id: summary.id, title: "Fork: hello" });
 
       const childPath = newChildPath(f, before);
       const childEntries = readFileSync(childPath, "utf8").trimEnd().split("\n").map((line) => JSON.parse(line));
@@ -458,11 +482,11 @@ describe("native side-chat forks", () => {
       // The child continues the parent from the branch endpoint, and the
       // parent is byte-identical after the fork.
       expect(readFileSync(f.file, "utf8")).toBe(parentBytes);
-      expect(child.title).toBe("Side chat: hello");
+      expect(child.title).toBe("Fork: hello");
       expect(child.messages.map((message) => message.content)).toEqual(["hello", "first answer", "compacted", "second answer"]);
       expect(child).toMatchObject({ source: "pi-native", modelId: "test-model", thinkingLevel: "high" });
       expect(child.capabilities?.canPrompt).toBe(true);
-      expect(service.detail(child.id)?.title).toBe("Side chat: hello");
+      expect(service.detail(child.id)?.title).toBe("Fork: hello");
     } finally { service.disposeAll(); }
   });
 
@@ -523,8 +547,9 @@ describe("native side-chat forks", () => {
       expect(after.match(/fixture reply/g)).toHaveLength(1);
       const reopened = SessionManager.open(childPath);
       const branch = reopened.getBranch().filter((entry) => entry.type === "message");
-      expect(branch.map((entry) => entry.message.role)).toEqual(["user", "user", "assistant"]);
-      expect(new Set(branch.map((entry) => entry.id)).size).toBe(3);
+      const visibleBranch = branch.filter((entry) => entry.message.role !== "system");
+      expect(visibleBranch.map((entry) => entry.message.role)).toEqual(["user", "user", "assistant"]);
+      expect(new Set(visibleBranch.map((entry) => entry.id)).size).toBe(3);
       expect(reopened.getSessionId()).toBe(childId);
       expect(readFileSync(f.file, "utf8")).toBe(parentBytes);
     } finally { service.disposeAll(); }

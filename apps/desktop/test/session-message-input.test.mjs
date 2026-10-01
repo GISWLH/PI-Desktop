@@ -4,7 +4,7 @@ import test from "node:test";
 import { IPC } from "@pi-desktop/shared";
 
 register(new URL("./helpers/ts-import-hooks.mjs", import.meta.url));
-const { resolveSessionMessageInput } = await import("../electron/main/session-message-input.ts");
+const { resolveSessionMessageInput } = await import("../../../packages/host-runtime/src/session-message-input.ts");
 const { registerAgentIpc } = await import("../electron/main/ipc/agent-ipc.ts");
 
 const message = {
@@ -26,6 +26,17 @@ test("collaboration input and origin come exclusively from the host ledger", asy
   assert.deepEqual(calls, [{ method: "session.collaboration.message", params: { messageId: message.id } }]);
   assert.equal(await resolveSessionMessageInput(host, { sessionId: "target", content: "human input" }), undefined);
   assert.equal(calls.length, 1);
+});
+
+test("caller-supplied completion provenance never replaces a ledger task", async () => {
+  const forged = { ...origin, kind: "completion", replyToMessageId: "task-1" };
+  const host = { call: async () => ({ message }) };
+  assert.equal(await resolveSessionMessageInput(host, {
+    sessionId: "target", content: "completion", sessionMessage: forged,
+  }), undefined);
+  assert.deepEqual(await resolveSessionMessageInput(host, { ...request, sessionMessage: forged }), {
+    content: message.content, origin,
+  });
 });
 
 test("collaboration dispatch rejects missing, cross-session and already dispatched records", async () => {
@@ -98,4 +109,79 @@ test("prompt IPC persists original session text, skips slash expansion and binds
   assert.deepEqual(sidecarCalls[0].params.sessionMessage, origin);
   assert.equal(events.length, 2);
   assert.equal(released, true);
+});
+
+test("abort waits for prompt admission before dispatching to the sidecar", async () => {
+  const handlers = new Map();
+  const calls = [];
+  let releasePrompt;
+  let releaseSessionOperation;
+  let firstSessionOperation = true;
+  const promptGate = new Promise((resolve) => { releasePrompt = resolve; });
+  const sessionGate = new Promise((resolve) => { releaseSessionOperation = resolve; });
+  const host = {
+    async call(method) {
+      calls.push(method);
+      if (method === "settings.get") return {};
+      if (method === "session.get") return { session: { id: "target", messages: [] } };
+      if (method === "session.beginTurn") return { turnId: "turn-1" };
+      if (method === "session.appendMessage") return {};
+      assert.fail(`unexpected RPC ${method}`);
+    },
+  };
+  const activeTurns = new Map();
+  const sidecarCalls = [];
+  const finishedTurns = [];
+  registerAgentIpc({
+    registrar: { handle: (channel, handler) => handlers.set(channel, handler) },
+    getHost: () => host,
+    getSidecar: () => ({
+      setProjectInstructionRoot() {},
+      async call(method) {
+        sidecarCalls.push(method);
+        if (method === "agent.prompt") {
+          await promptGate;
+          return { accepted: true, turnId: "turn-1" };
+        }
+        if (method === "agent.abort") return { ok: true, aborted: true };
+        assert.fail(`unexpected sidecar RPC ${method}`);
+      },
+    }),
+    getAgentHostBridge: () => null,
+    logger: { app() {} }, vendorOAuth: {}, agentExtensions: { cancelPrompts() {} }, cancelSessionTools() {},
+    persistenceOutbox: {}, dataDir: "/unused-for-no-attachments",
+    activeTurns, activeTurnUsages: new Map(), approvedExecutionIdsBySession: new Map(), claimedExecutionSessions: new Map(),
+    resolveAgentRuntimeLaunch: async () => ({
+      providerId: "provider", modelId: "model",
+      sidecarParams: { sessionId: "target", provider: { modelConfig: { input: ["text"] } } },
+    }),
+    acquireSessionOperation: async () => {
+      if (firstSessionOperation) {
+        firstSessionOperation = false;
+        return () => releaseSessionOperation();
+      }
+      await sessionGate;
+      return () => {};
+    },
+    finishTurn: async (...args) => { finishedTurns.push(args); },
+    lockAbortReason() {}, async finishApprovedExecution() {}, async dispatchApprovedPlan() {},
+    async dispatchExecutionForProposal() {}, emitAgentEvent() {}, setNotificationViewingSessionId() {},
+    optionalWorkspaceRoot: async () => null,
+    composerCommandService: { buildComposerCommands: async () => [] },
+    loadComposerTemplatesCached: async () => [],
+  });
+
+  const prompt = handlers.get(IPC.invoke.agentPrompt)({ sessionId: "target", content: "hello" });
+  await Promise.resolve();
+  const abort = handlers.get(IPC.invoke.agentAbort)({ sessionId: "target" });
+  await Promise.resolve();
+  assert.equal(sidecarCalls.includes("agent.abort"), false, "abort must not bypass prompt admission");
+
+  releasePrompt();
+  await prompt;
+  await abort;
+  assert.deepEqual(sidecarCalls, ["agent.prompt", "agent.abort"]);
+  assert.equal(activeTurns.get("target"), "turn-1");
+  assert.deepEqual(finishedTurns, [["target", "aborted", "TURN_ABORTED", { turnId: "turn-1" }]]);
+  assert.deepEqual(calls.slice(0, 2), ["settings.get", "session.get"]);
 });

@@ -37,7 +37,15 @@ test("plugins page styles use design tokens in both themes", () => {
   assert.match(section, /\.plugins-search\s*\{[\s\S]*?--ds-text-primary/);
   assert.match(section, /\.plugins-modal\s*\{[\s\S]*?--ds-bg-elevated-opaque/);
   assert.match(section, /\.plugins-installed-mark\s*\{[\s\S]*?--ds-success/);
-  assert.match(section, /:root\[data-theme="light"\] \.plugins-modal-backdrop/);
+  // The permission-review veil is a token now (issue #341): light's 32% ink sits
+  // in the light token block instead of a literal `:root[data-theme]` override,
+  // and dark reads the same token from the base rule.
+  assert.match(
+    section,
+    /\.plugins-modal-backdrop\s*\{[^}]*background:\s*var\(--ds-modal-veil\)/,
+  );
+  assert.equal((stylesSource.match(/^\s*--ds-modal-veil:/gm) ?? []).length, 2);
+  assert.doesNotMatch(stylesSource, /:root\[data-theme="light"\] \.plugins-modal-backdrop/);
   // D296: the header, title glyph and segmented control carry tone, not rules.
   assert.doesNotMatch(section, /\.plugins-page-header\s*\{[^}]*border-bottom/);
   assert.match(section, /\.plugins-title-icon\s*\{[^}]*background:\s*var\(--plugins-tile-deep\)/);
@@ -132,9 +140,9 @@ test("installed row controls share one aligned rail and explain icon actions", (
 // rightmost 120px. The page header lives in that band, so the frame must reserve
 // it on macOS too or the title row paints underneath. The plugins page is the one
 // destination page with controls in that corner (header actions, detail-sheet
-// close), so both must clear the band. The sheet's fixed layer stacks inside the
-// route surface (its entry animation leaves a transform behind), so the band
-// paints over the sheet on every platform and the sheet reserves it everywhere.
+// close), so both must clear the band. The sheet mounts on the viewport overlay
+// host, so its fixed layer is independent of the route surface while its own
+// head still reserves the titlebar band.
 test("plugins page keeps its header clear of the titlebar band on every platform", () => {
   assert.match(
     stylesSource,

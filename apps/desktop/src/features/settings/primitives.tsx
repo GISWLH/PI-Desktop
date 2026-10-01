@@ -12,38 +12,86 @@ import {
 } from "@pi-desktop/shared";
 import { api } from "../../lib/api";
 import { resolveContextUsageDisplay } from "../../lib/context-usage";
-import { Input, Select, cx } from "../../components/ui";
+import { HelpIcon, Input, SegmentedControl } from "../../components/ui";
+import { SettingsMenuSelect } from "../../components/settings/SettingsMenuSelect";
+import { useAppStore } from "../../stores/app-store";
 
+/**
+ * One settings decision: the title and its control on a single line.
+ *
+ * The explanation never occupies a permanent second line — it is reached from
+ * the question mark beside the title, which keeps a card scannable (D601).
+ * `detail` is the exception in kind, not in styling: a row that shows a live
+ * value (the pinned default model) keeps it visible, because that is data the
+ * user came to read, not prose explaining a switch.
+ */
 export function SettingsRow({
   title,
   description,
+  detail,
   children,
 }: {
   title: string;
-  description?: ReactNode;
+  /** Explanatory copy, revealed on demand from the help icon. */
+  description?: string;
+  /** Live row metadata that stays visible (not an explanation). */
+  detail?: ReactNode;
   children: ReactNode;
 }) {
   return (
     <div className="settings-row">
       <div className="settings-row-copy">
-        <div className="settings-row-title">{title}</div>
-        {description ? <div className="settings-row-desc">{description}</div> : null}
+        <div className="settings-row-title">
+          {title}
+          {description ? <HelpIcon label={description} /> : null}
+        </div>
+        {detail ? <div className="settings-row-detail">{detail}</div> : null}
       </div>
       <div className="settings-row-control">{children}</div>
     </div>
   );
 }
 
+/**
+ * A titled group of rows. `description` follows the same rule as a row's: it
+ * explains the card, so it lives behind the heading's help icon. `action` is a
+ * card-level control (for example a link to another Settings destination) and
+ * belongs on the heading line, not among the rows.
+ */
 export function SettingsCard({
   title,
+  description,
+  action,
   children,
 }: {
   title?: string;
+  description?: string;
+  /** Card-level control rendered at the end of the heading line. */
+  action?: ReactNode;
   children: ReactNode;
 }) {
   return (
     <section className="settings-card-block">
-      {title ? <h3 className="settings-card-heading">{title}</h3> : null}
+      {title ? (
+        /*
+          The help mark is the heading's sibling, not its child: a nested
+          button joins the heading's accessible name, and a screen reader's
+          list of headings should not read out every explanation.
+        */
+        <div
+          className={
+            action
+              ? "settings-card-heading-row settings-card-heading-with-action"
+              : "settings-card-heading-help"
+          }
+        >
+          <div className="settings-card-heading-help">
+            <h3 className="settings-card-heading">{title}</h3>
+            {description ? <HelpIcon label={description} /> : null}
+          </div>
+          {action}
+        </div>
+      ) : null}
       <div className="settings-panel">{children}</div>
     </section>
   );
@@ -59,7 +107,7 @@ export function CommandShellRow({
   const { t } = useTranslation();
   const [catalog, setCatalog] = useState<CommandShellCatalog | null>(null);
   const [loadError, setLoadError] = useState(false);
-  const [saveError, setSaveError] = useState(false);
+  const showToast = useAppStore((state) => state.showToast);
   const [selectedOverride, setSelectedOverride] =
     useState<CommandShellId | null>(null);
   const [saving, setSaving] = useState(false);
@@ -115,7 +163,6 @@ export function CommandShellRow({
     const choice = catalog.choices.find((candidate) => candidate.id === value);
     if (!choice || !choice.available) return;
     setSaving(true);
-    setSaveError(false);
     setSelectedOverride(choice.id);
     try {
       await saveSettings({ defaultCommandShell: choice.id });
@@ -131,17 +178,14 @@ export function CommandShellRow({
       );
     } catch {
       setSelectedOverride(null);
-      setSaveError(true);
+      showToast(t("settings.commandShellSaveError"), { variant: "error" });
     } finally {
       setSaving(false);
     }
   };
 
   return (
-    <SettingsRow
-      title={t("settings.commandShell")}
-      description={t("settings.commandShellDesc")}
-    >
+    <SettingsRow title={t("settings.commandShell")}>
       <div
         className="settings-command-shell-control"
         aria-busy={saving || (!catalog && !loadError)}
@@ -157,30 +201,25 @@ export function CommandShellRow({
             {t("settings.commandShellNoChoices")}
           </span>
         ) : (
-          <Select
+          <SettingsMenuSelect
             className="settings-command-shell-select"
+            label={t("settings.commandShell")}
             value={selectedId}
-            disabled={saving}
-            aria-label={t("settings.commandShell")}
-            onChange={(event) => void onChange(event.target.value)}
-          >
-            {catalog.choices.map((choice) => (
-              <option key={choice.id} value={choice.id} disabled={!choice.available}>
-                {choice.label}
-                {!choice.available
-                  ? ` - ${t("settings.commandShellUnavailable")}`
-                  : ""}
-              </option>
-            ))}
-          </Select>
+            busy={saving}
+            onChange={(value) => void onChange(value)}
+            options={catalog.choices.map((choice) => ({
+              id: choice.id,
+              label: `${choice.label}${
+                choice.available
+                  ? ""
+                  : ` - ${t("settings.commandShellUnavailable")}`
+              }`,
+              disabled: !choice.available,
+            }))}
+          />
         )}
         {effectiveStatus ? (
           <span className="settings-command-shell-status">{effectiveStatus}</span>
-        ) : null}
-        {saveError ? (
-          <span className="settings-command-shell-state error" role="status">
-            {t("settings.commandShellSaveError")}
-          </span>
         ) : null}
       </div>
     </SettingsRow>
@@ -196,33 +235,17 @@ export function LinkOpenTargetRow({
   const { t } = useTranslation();
   const current = settings.linkOpenTarget ?? "workpanel";
   return (
-    <SettingsRow
-      title={t("settings.linkOpenTarget")}
-      description={t("settings.linkOpenTargetDesc")}
-    >
-      <div
-        className="settings-segment"
+    <SettingsRow title={t("settings.linkOpenTarget")}>
+      <SegmentedControl
+        value={current}
+        onChange={(value) => void saveSettings({ linkOpenTarget: value })}
+        options={[
+          { value: "workpanel", label: t("settings.linkOpenTargetWorkpanel") },
+          { value: "external", label: t("settings.linkOpenTargetExternal") },
+        ]}
+        label={t("settings.linkOpenTarget")}
         role="group"
-        aria-label={t("settings.linkOpenTarget")}
-      >
-        {([
-          ["workpanel", "settings.linkOpenTargetWorkpanel"],
-          ["external", "settings.linkOpenTargetExternal"],
-        ] as const).map(([value, labelKey]) => (
-          <button
-            key={value}
-            type="button"
-            className={cx(
-              "settings-segment-item",
-              current === value && "active",
-            )}
-            aria-pressed={current === value}
-            onClick={() => void saveSettings({ linkOpenTarget: value })}
-          >
-            {t(labelKey)}
-          </button>
-        ))}
-      </div>
+      />
     </SettingsRow>
   );
 }
@@ -242,34 +265,16 @@ export function ContextUsageDisplayRow({
   const { t } = useTranslation();
   const current = resolveContextUsageDisplay(settings.contextUsageDisplay);
   return (
-    <SettingsRow
-      title={t("settings.contextUsageDisplay")}
-      description={t("settings.contextUsageDisplayDesc")}
-    >
-      <div
-        className="settings-segment"
-        role="radiogroup"
-        aria-label={t("settings.contextUsageDisplay")}
-      >
-        {([
-          ["remaining", "settings.contextUsageDisplayRemaining"],
-          ["used", "settings.contextUsageDisplayUsed"],
-        ] as const).map(([value, labelKey]) => (
-          <button
-            key={value}
-            type="button"
-            role="radio"
-            aria-checked={current === value}
-            className={cx(
-              "settings-segment-item",
-              current === value && "active",
-            )}
-            onClick={() => void saveSettings({ contextUsageDisplay: value })}
-          >
-            {t(labelKey)}
-          </button>
-        ))}
-      </div>
+    <SettingsRow title={t("settings.contextUsageDisplay")}>
+      <SegmentedControl
+        value={current}
+        onChange={(value) => void saveSettings({ contextUsageDisplay: value })}
+        options={[
+          { value: "remaining", label: t("settings.contextUsageDisplayRemaining") },
+          { value: "used", label: t("settings.contextUsageDisplayUsed") },
+        ]}
+        label={t("settings.contextUsageDisplay")}
+      />
     </SettingsRow>
   );
 }
@@ -286,7 +291,7 @@ export function LargePasteThresholdRow({
     settings.largePasteThreshold,
   );
   const [draft, setDraft] = useState(String(currentThreshold));
-  const [saveError, setSaveError] = useState(false);
+  const showToast = useAppStore((state) => state.showToast);
 
   useEffect(() => {
     setDraft(String(currentThreshold));
@@ -302,15 +307,13 @@ export function LargePasteThresholdRow({
         : currentThreshold;
     setDraft(String(next));
     if (next === currentThreshold) {
-      setSaveError(false);
       return;
     }
-    setSaveError(false);
     try {
       await saveSettings({ largePasteThreshold: next });
     } catch {
       setDraft(String(currentThreshold));
-      setSaveError(true);
+      showToast(t("settings.largePasteThresholdSaveError"), { variant: "error" });
     }
   };
 
@@ -328,7 +331,6 @@ export function LargePasteThresholdRow({
           inputMode="numeric"
           value={draft}
           aria-label={t("settings.largePasteThreshold")}
-          aria-invalid={saveError}
           onChange={(event) => setDraft(event.target.value)}
           onBlur={() => void commit()}
           onKeyDown={(event) => {
@@ -338,11 +340,6 @@ export function LargePasteThresholdRow({
             }
           }}
         />
-        {saveError ? (
-          <span className="settings-command-shell-state error" role="status">
-            {t("settings.largePasteThresholdSaveError")}
-          </span>
-        ) : null}
       </div>
     </SettingsRow>
   );

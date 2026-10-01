@@ -13,6 +13,8 @@ import {
   committedWorkPanelChatWidth,
   parseWorkPanelChatWidth,
   workPanelLayout,
+  workPanelResetWidth,
+  workPanelWidthBounds,
   workPanelChatWidthFromPointer,
   workPanelWidthForSidebarReopen,
 } from "../src/lib/work-panel-resize.ts";
@@ -169,7 +171,9 @@ test("clamps the work panel to its minimum without a fixed upper bound", () => {
 });
 
 test("clamps the conversation area to its bounded native resize range", () => {
-  assert.equal(clampWorkPanelChatWidth(900), WORK_PANEL_CHAT_MIN_WIDTH);
+  assert.equal(WORK_PANEL_CHAT_MIN_WIDTH, 800);
+  assert.equal(clampWorkPanelChatWidth(700), WORK_PANEL_CHAT_MIN_WIDTH);
+  assert.equal(clampWorkPanelChatWidth(900), 900);
   assert.equal(clampWorkPanelChatWidth(1200), 1200);
   assert.equal(clampWorkPanelChatWidth(20000), WORK_PANEL_CHAT_MAX_WIDTH);
 });
@@ -211,10 +215,45 @@ test("commits only a changed conversation preview after a completed gesture", ()
 });
 
 test("accepts only bounded integer conversation widths over IPC", () => {
-  assert.equal(parseWorkPanelChatWidth({ width: 1040 }), 1040);
+  assert.equal(parseWorkPanelChatWidth({ width: 800 }), 800);
   assert.equal(parseWorkPanelChatWidth({ width: 10000 }), 10000);
-  assert.equal(parseWorkPanelChatWidth({ width: 1039 }), null);
+  assert.equal(parseWorkPanelChatWidth({ width: 799 }), null);
   assert.equal(parseWorkPanelChatWidth({ width: 10000.5 }), null);
   assert.equal(parseWorkPanelChatWidth({ width: "1200" }), null);
   assert.equal(parseWorkPanelChatWidth(null), null);
+});
+
+test("double-click resets the panel to its default width", () => {
+  assert.equal(WORK_PANEL_DEFAULT_WIDTH, 360);
+  assert.equal(
+    workPanelResetWidth(WORK_PANEL_MIN_WIDTH, 800),
+    WORK_PANEL_DEFAULT_WIDTH,
+  );
+  assert.equal(
+    workPanelResetWidth(WORK_PANEL_COMPACT_MIN_WIDTH, 800),
+    WORK_PANEL_DEFAULT_WIDTH,
+  );
+  assert.equal(
+    workPanelResetWidth(WORK_PANEL_MIN_WIDTH, 400),
+    WORK_PANEL_DEFAULT_WIDTH,
+  );
+});
+
+test("a reset stays inside the live bounds instead of breaching MainChat", () => {
+  // A narrower budget than the default keeps the capped width.
+  assert.equal(workPanelResetWidth(WORK_PANEL_MIN_WIDTH, 300), 300);
+  assert.equal(workPanelResetWidth(WORK_PANEL_COMPACT_MIN_WIDTH, 120), 120);
+  assert.deepEqual(workPanelWidthBounds(WORK_PANEL_COMPACT_MIN_WIDTH, 120), {
+    minimum: WORK_PANEL_COMPACT_MIN_WIDTH,
+    maximum: 120,
+  });
+  // The three-column budget replaces the regular minimum when it is smaller.
+  assert.deepEqual(workPanelWidthBounds(WORK_PANEL_MIN_WIDTH, 120), {
+    minimum: 120,
+    maximum: 120,
+  });
+  assert.deepEqual(workPanelWidthBounds(WORK_PANEL_MIN_WIDTH, 800), {
+    minimum: WORK_PANEL_MIN_WIDTH,
+    maximum: 800,
+  });
 });

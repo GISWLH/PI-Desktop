@@ -1,7 +1,6 @@
 import type {
   MarketPluginSummary,
   PluginCapability,
-  PluginFsPolicy,
   PluginSummary,
 } from "@pi-desktop/shared";
 
@@ -38,6 +37,8 @@ export type RiskTier = "high" | "medium" | "low";
 /** Mirrors the risk column of docs/spec/07-plugins/13-plugin-permissions-matrix.md. */
 export const PERMISSION_RISK: Record<string, RiskTier> = {
   "net.fetch": "high",
+  // Reaches any host the user types in; same tier as the outbound paths.
+  "net.anyHost": "high",
   "fs.write": "high",
   "fs.delete": "high",
   "fs.write.workspace": "high",
@@ -46,6 +47,8 @@ export const PERMISSION_RISK: Record<string, RiskTier> = {
   "agent.tool.register": "high",
   "agent.complete": "high",
   "agent.extension": "high",
+  // Its code runs in the app's own document, so the grant is the boundary.
+  "renderer.extension": "high",
   "desktop.control": "high",
   "session.read": "high",
   "browser.cdp": "high",
@@ -60,10 +63,13 @@ export const PERMISSION_RISK: Record<string, RiskTier> = {
   "mcp.server.local": "high",
   "mcp.server.remote": "high",
   "background.service": "high",
+  // Per-turn counters and session titles only, per the usage.read matrix row.
+  "usage.read": "medium",
   // Two capabilities that reach outside PI-Desktop's own window or read its
   // live audio stream sit at the top tier with the other outbound paths.
   "net.websocket": "high",
   "audio.capture.background": "high",
+  "speech.adapter.register": "high",
   "audio.playback.background": "medium",
   "keyboard.globalShortcut": "medium",
   "bus.publish": "medium",
@@ -78,6 +84,7 @@ export const PERMISSION_RISK: Record<string, RiskTier> = {
 export const CAPABILITY_ORDER: PluginCapability[] = [
   "panel",
   "views",
+  "rendererUi",
   "commands",
   "tools",
   "agentExtension",

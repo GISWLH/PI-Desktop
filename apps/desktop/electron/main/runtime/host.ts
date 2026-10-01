@@ -76,6 +76,13 @@ export function createHostRuntime({
     // Notifications from a previous host generation must never reach the
     // current plugin/renderer bridge after a restart.
     if (runtimeState.host !== h) return;
+    // An install reports itself, so the dialog that shows it can follow the
+    // phases, the mirror being tried and the bytes that have arrived. Nothing
+    // here decides anything: the request's own answer is still the outcome.
+    if (method === "plugin.installProgress") {
+      sendToRenderer(IPC.event.pluginInstallProgress, params);
+      return;
+    }
     if (method === "permissions.request") {
       const permission = params as {
         requestId: string;
@@ -126,6 +133,9 @@ export function createHostRuntime({
             ...(asking?.parentToolCallId
               ? { parentToolCallId: asking.parentToolCallId }
               : {}),
+            ...(asking?.nestedParentToolCallId
+              ? { nestedParentToolCallId: asking.nestedParentToolCallId }
+              : {}),
           },
         },
       };
@@ -153,14 +163,16 @@ export function createHostRuntime({
         let payload: Record<string, unknown>;
         if (q.toolName.startsWith("mcp_")) {
           try {
-            const result = await userMcp.callTool(q.toolName, q.args, projectPath);
+            const result = await userMcp.callTool(q.toolName, q.args, projectPath, q.sessionId);
             payload = { executionId: q.executionId, ok: true, content: result ?? null };
           } catch (e) {
             payload = {
               executionId: q.executionId,
               ok: false,
               errorCode:
-                (e as { errorCode?: string })?.errorCode ?? "TOOL_FAILED",
+                (e as { code?: string; errorCode?: string })?.code === "TOOL_ABORTED"
+                  ? "TOOL_ABORTED"
+                  : (e as { errorCode?: string })?.errorCode ?? "TOOL_FAILED",
               content: { error: e instanceof Error ? e.message : String(e) },
             };
           }
@@ -262,7 +274,7 @@ export function createHostRuntime({
             payload = {
               executionId: q.executionId,
               ok: false,
-              errorCode: code === "PERMISSION_DENIED" ? "PERMISSION_DENIED" : "TOOL_FAILED",
+              errorCode: code === "PERMISSION_DENIED" || code === "TOOL_ABORTED" ? code : "TOOL_FAILED",
               content: { error: e instanceof Error ? e.message : String(e) },
             };
           }
@@ -295,6 +307,15 @@ export function createHostRuntime({
       );
     } else if (method === "plans.changed") {
       sendToRenderer(IPC.event.plansChanged, params);
+    } else if (method === "todos.changed") {
+      sendToRenderer(IPC.event.todosChanged, params);
+    } else if (method === "configSync.changed") {
+      sendToRenderer(IPC.event.configSyncChanged, params);
+    } else if (method === "configSync.progress") {
+      // A sync is one request that answers only when it is over, so these
+      // reports are the only thing the page has to show while it runs. The
+      // request's own answer is still the outcome.
+      sendToRenderer(IPC.event.configSyncProgress, params);
     }
   });
   h.onExit(({ code, signal, intentional }) => {

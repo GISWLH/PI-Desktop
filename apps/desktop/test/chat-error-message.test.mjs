@@ -46,4 +46,54 @@ test("assistant error messages expose readable provider details and one Continue
   assert.match(component, /errors\.action\.continue/);
   assert.match(component, /chat\.continueCurrentTaskPrompt/);
   assert.match(component, /setSettingsTab\("agent"\)/);
+
+// Issue #234: the localized NETWORK_ERROR summary cannot tell DNS from TLS from
+// a dropped socket, so both failure surfaces render the transport errno next to
+// the stable code.
+test("network failures show the transport errno beside the error code", async () => {
+  const [transcript, activityGroup] = await Promise.all([
+    readTranscriptSource(),
+    read("src/features/chat/transcript/ActivityGroup.tsx"),
+  ]);
+  const card = transcript.slice(
+    transcript.indexOf("function AssistantErrorMessage"),
+    transcript.indexOf("const TOOL_ACTION_KEYS"),
+  );
+
+  assert.match(card, /error\.details/);
+  assert.match(card, /networkCode/);
+  assert.match(activityGroup, /retryError\.networkCode/);
+});
+});
+
+test("dismissing an assistant error hides its card without changing transcript data", async () => {
+  const [transcript, appState, initialState, interactionSlice, sessionSlice] =
+    await Promise.all([
+      readTranscriptSource(),
+      read("src/stores/app-state.ts"),
+      read("src/stores/slices/initial-state.ts"),
+      read("src/stores/slices/interaction-slice.ts"),
+      read("src/stores/slices/session-slice.ts"),
+    ]);
+  const component = transcript.slice(
+    transcript.indexOf("function AssistantErrorMessage"),
+    transcript.indexOf("const TOOL_ACTION_KEYS"),
+  );
+  const dismissAction = interactionSlice.slice(
+    interactionSlice.indexOf("dismissAssistantErrorMessage:"),
+    interactionSlice.indexOf("setPage:"),
+  );
+
+  assert.match(component, /dismissedAssistantErrorMessages\[message\.id\]/);
+  assert.match(component, /if \(!error \|\| dismissed\) return null/);
+  assert.match(component, /aria-label=\{t\("chat\.dismissError"\)\}/);
+  assert.match(component, /title=\{t\("chat\.dismissError"\)\}/);
+  assert.match(component, /onClick=\{\(\) => dismissAssistantErrorMessage\(message\.id\)\}/);
+  assert.match(appState, /messages: UiMessage\[\];/);
+  assert.match(appState, /dismissedAssistantErrorMessages: Record<string, true>/);
+  assert.match(initialState, /dismissedAssistantErrorMessages: \{\}/);
+  assert.match(dismissAction, /\.\.\.state\.dismissedAssistantErrorMessages/);
+  assert.match(dismissAction, /\[messageId\]: true/);
+  assert.doesNotMatch(dismissAction, /messages\s*:|replaceSessionMessages|deleteMessage|api\./);
+  assert.doesNotMatch(sessionSlice, /dismissedAssistantErrorMessages/);
 });

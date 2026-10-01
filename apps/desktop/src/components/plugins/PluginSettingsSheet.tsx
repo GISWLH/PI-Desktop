@@ -14,9 +14,20 @@ import {
   type ShortcutPlatform,
 } from "@pi-desktop/shared";
 import { api } from "../../lib/api";
+import { useBlockingOverlay } from "../../lib/blocking-overlay";
 import { useAppStore } from "../../stores/app-store";
-import { Button, TooltipButton, cx, Input, Select, Textarea } from "../ui";
+import {
+  Button,
+  HelpIcon,
+  Input,
+  SettingsToggle,
+  Textarea,
+  TooltipButton,
+  cx,
+  portalOverlay,
+} from "../ui";
 import { IconKeyboard, IconSettings, IconX } from "../icons";
+import { SettingsMenuSelect } from "../settings/SettingsMenuSelect";
 
 type Props = {
   plugin: PluginSummary;
@@ -57,8 +68,12 @@ function serializeJson(value: unknown): string {
 }
 
 export function PluginSettingsSheet({ plugin, platform, onClose, onSaved }: Props) {
+  // Native plugin views composite above the renderer; hide them while this
+  // host sheet is open so the right edge of the dialog stays clickable.
+  useBlockingOverlay();
   const { t } = useTranslation();
   const appKeybindings = useAppStore((state) => state.settings?.keybindings);
+  const showToast = useAppStore((state) => state.showToast);
   const settings = plugin.settings ?? [];
   const [draft, setDraft] = useState<Record<string, unknown>>(() =>
     Object.fromEntries(settings.map((setting) => [setting.key, initialValue(setting)])),
@@ -122,7 +137,7 @@ export function PluginSettingsSheet({ plugin, platform, onClose, onSaved }: Prop
       await onSaved();
       onClose();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      showToast(cause instanceof Error ? cause.message : String(cause), { variant: "error" });
     } finally {
       setSaving(false);
     }
@@ -144,7 +159,7 @@ export function PluginSettingsSheet({ plugin, platform, onClose, onSaved }: Prop
     setRecordingKey(null);
   };
 
-  return (
+  return portalOverlay(
     <div className="plugins-modal-backdrop" role="presentation">
       <div
         className="plugins-modal plugins-settings-modal"
@@ -181,11 +196,13 @@ export function PluginSettingsSheet({ plugin, platform, onClose, onSaved }: Prop
                 <div className="plugins-setting-copy">
                   <div className="plugins-setting-title">
                     {isShortcut ? <IconKeyboard size={14} aria-hidden="true" /> : null}
-                    <span>{setting.title}</span>
+                    <span>
+                      {setting.title}
+                      {/* The plugin's own blurb about the field; a setting that
+                          declares none leaves no mark. */}
+                      {setting.description ? <HelpIcon label={setting.description} /> : null}
+                    </span>
                   </div>
-                  {setting.description ? (
-                    <p className="plugins-setting-description">{setting.description}</p>
-                  ) : null}
                   {isShortcut ? (
                     <span className="plugins-setting-scope">{t("plugins.settingsPluginScope")}</span>
                   ) : null}
@@ -200,28 +217,24 @@ export function PluginSettingsSheet({ plugin, platform, onClose, onSaved }: Prop
                       onChange={(event) => setValue(setting.key, event.target.value === "" ? 0 : Number(event.target.value))}
                     />
                   ) : setting.type === "boolean" ? (
-                    <button
-                      type="button"
-                      className={cx("settings-toggle", value === true && "on")}
-                      role="switch"
-                      aria-checked={value === true}
-                      aria-label={setting.title}
-                      onClick={() => setValue(setting.key, value !== true)}
-                    >
-                      <span className="settings-toggle-thumb" />
-                    </button>
+                    <SettingsToggle
+                      checked={value === true}
+                      label={setting.title}
+                      onChange={() => setValue(setting.key, value !== true)}
+                    />
                   ) : setting.type === "select" ? (
-                    <Select
+                    <SettingsMenuSelect
+                      label={setting.title}
                       value={String((setting.enum ?? []).findIndex((option) => Object.is(option.value, value)))}
-                      onChange={(event) => {
-                        const option = setting.enum?.[Number(event.target.value)];
+                      onChange={(id) => {
+                        const option = setting.enum?.[Number(id)];
                         if (option) setValue(setting.key, option.value);
                       }}
-                    >
-                      {(setting.enum ?? []).map((option, index) => (
-                        <option key={`${setting.key}-${index}`} value={index}>{option.label}</option>
-                      ))}
-                    </Select>
+                      options={(setting.enum ?? []).map((option, index) => ({
+                        id: String(index),
+                        label: option.label,
+                      }))}
+                    />
                   ) : setting.type === "json" ? (
                     <Textarea
                       className="plugins-setting-json"
@@ -256,6 +269,6 @@ export function PluginSettingsSheet({ plugin, platform, onClose, onSaved }: Prop
           </Button>
         </div>
       </div>
-    </div>
+    </div>,
   );
 }

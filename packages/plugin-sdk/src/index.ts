@@ -8,7 +8,6 @@ import {
 import { validateMcpServer } from "./mcp-config.js";
 import { parseNetDomains, type PluginNetDomain } from "./net-policy.js";
 import {
-  isExternalThemeAssetPath,
   isThemeAssetPath,
   normalizeThemeAssetPath,
   THEME_ASSET_EXTENSIONS,
@@ -27,17 +26,61 @@ export const PLUGIN_ID_PATTERN = /^[a-z0-9]+(\.[a-z0-9_-]+)+$/;
 /** `author` may be a display string or a contact object (manifest schema §2). */
 export type PluginManifestAuthor =
   | string
+  | string
   | { name: string; email?: string; url?: string };
 
+/**
+ * One locale's display strings (`manifest.i18n`).
+ *
+ * `en` and `zh-CN` are the contract locales: the shell reads `zh-CN` for every
+ * Chinese locale and English for everything else. Every field is optional, and
+ * a partially translated block falls back per field, so a missing one keeps the
+ * author's own `name` / `description` instead of blanking it out.
+ */
+export type PluginDisplayI18n = {
+  name?: string;
+  description?: string;
+  safetyNotes?: string;
+};
+
+/** Locale id → display strings, as a plugin declares them in `manifest.i18n`. */
+export type PluginI18nMap = Record<string, PluginDisplayI18n>;
 export type PluginManifest = {
   schemaVersion: number;
   id: string;
   name: string;
   version: string;
   description?: string;
+  /**
+   * Display strings per locale. The flat `name`/`description` above stay the
+   * author's own language and remain the fallback; the shell shows the entry
+   * matching the app language and only reads these two contract locales.
+   */
+  i18n?: PluginI18nMap;
   author?: PluginManifestAuthor;
   homepage?: string;
   repository?: string;
+  /**
+   * Renderer entry (ES module path relative to the plugin root). Declaring it
+   * requires the `renderer.extension` permission; the module loads into the
+   * host renderer and registers UI slot components through `pi.slots`.
+   */
+  renderer?: string;
+  /**
+   * Outbound actions the renderer components may dispatch
+   * (`PLUGIN_RENDERER_ACTIONS`). Declaring fewer is safe; an action outside
+   * this list is refused with `PLUGIN_ACTION_UNDECLARED`. A word this host does
+   * not implement still installs, so a manifest written for a newer host
+   * loads, and is refused at dispatch with `PLUGIN_ACTION_UNKNOWN`. Requires
+   * `renderer.extension`.
+   */
+  rendererActions?: string[];
+  /**
+   * Methods the plugin's `onRendererCall` answers for `plugin.call`.
+   * Whitelist: an undeclared method is refused with `PLUGIN_CALL_NO_HANDLER`.
+   * Requires `renderer.extension`.
+   */
+  rendererCallMethods?: string[];
   main: string;
   icon?: string;
   /**
@@ -51,6 +94,19 @@ export type PluginManifest = {
     width?: number;
     height?: number;
     title?: PluginLocalizedString | string;
+    /**
+     * Panel placement. `"panel"` (default) keeps the host-owned 46px titlebar
+     * band and its three-control capsule. `"widget"` opens the same sandboxed
+     * page as a transparent, frameless floating surface: no band, no capsule,
+     * a drag map over the whole window, and a host context menu that closes,
+     * minimizes, or pins it. A widget may be smaller than a panel — see
+     * `PLUGIN_PANEL_MIN_SIZE` / `PLUGIN_PANEL_WIDGET_MIN_SIZE` in the host.
+     */
+    shape?: "panel" | "widget";
+    /** Floating widget placement only: keep the surface above other windows. */
+    alwaysOnTop?: boolean;
+    /** Overrides the per-shape default: panels are resizable, widgets are not. */
+    resizable?: boolean;
   };
   contributes?: {
     commands?: Array<{
@@ -90,8 +146,8 @@ export type PluginManifest = {
     providers?: PluginProviderContrib[];
     settings?: PluginSettingContrib[];
     themes?: PluginThemeContrib[];
-    /** Sandboxed pages placed exclusively in Settings' host-owned Extensions group. */
-    settingsDestinations?: PluginSettingsDestinationContrib[];
+    /** A host-rendered, image-card theme selector in Settings → Extensions. */
+    scenicThemes?: PluginScenicThemesContrib;
     /** Native window background for this plugin's themes (ADR 0248). */
     windowAppearance?: PluginWindowAppearanceContrib;
     mcpServers?: PluginMcpServerContrib[];
@@ -126,7 +182,11 @@ export type PluginManifest = {
   activationEvents?: string[];
 };
 
-/** A plugin-provided label. Shell UI may add locales; plugins still ship en + zh-CN. */
+/**
+ * Host-owned chrome labels (`ui.title`, views, destinations, session sources).
+ * Do not use this for plugin-owned copy; read `pi.app.getLocale` instead
+ * (ADR 0280). Shell UI may add locales; plugins still ship en + zh-CN.
+ */
 export type PluginLocalizedString = {
   en: string;
   "zh-CN": string;
@@ -240,6 +300,38 @@ export type PluginSessionGetResult = {
   updatedAt: string;
 };
 
+/**
+ * One completed turn as a flat fact row (`usage.read`). The host serves raw
+ * counters — per-turn tokens and identifiers only; no message body ever
+ * crosses the bridge, and every dashboard shape (streaks, heatmaps, shares)
+ * stays the plugin's own computation.
+ */
+export type PluginUsageTurn = {
+  turnId: string;
+  sessionId: string;
+  sessionTitle: string | null;
+  projectId: number | null;
+  providerId: string | null;
+  modelId: string | null;
+  startedAt: number;
+  endedAt: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  reasoningTokens: number;
+};
+
+/**
+ * A keyset-paginated page of completed turns, ordered by `endedAt`
+ * ascending. `nextCursor` is opaque: pass it back as `cursor` to fetch the
+ * next page; it is `null` when the window is exhausted.
+ */
+export type PluginUsageTurnPage = {
+  turns: PluginUsageTurn[];
+  nextCursor: string | null;
+};
+
 export type PluginSessionMessageResult = {
   id: string;
   role: "user" | "assistant" | "tool";
@@ -297,7 +389,9 @@ export type PluginSettingOption = {
 
 export type PluginSettingContrib = {
   key: string;
+  /** Author-language label for the generated sheet. Not a locale map (ADR 0280). */
   title: string;
+  /** Author-language help text for the generated sheet. */
   description?: string;
   type: PluginSettingType;
   default?: unknown;
@@ -329,7 +423,7 @@ export type PluginThemeContrib = {
   /** Base palette the overrides are layered on. Defaults to `dark`. */
   base?: "light" | "dark";
   /**
-   * Relative paths (extension whitelist, 4 MB summed) this theme's CSS may
+   * Package-relative or absolute paths (extension whitelist, 4 MB summed) this theme's CSS may
    * reference with `url()`. The host rewrites each matching reference to its own
    * `plugin-asset://` scheme; anything not declared here is still refused.
    */
@@ -338,12 +432,24 @@ export type PluginThemeContrib = {
   variables?: PluginThemeVariableContrib[];
 };
 
-export type PluginSettingsDestinationContrib = {
+/**
+ * Data only: the host owns every DOM node, style, and interaction for this
+ * Settings destination so a scenic canvas never sits behind a plugin document.
+ */
+export type PluginScenicThemesContrib = {
   id: string;
-  label: PluginLocalizedString | string;
-  icon: "sliders" | "sparkles" | "palette" | "plug" | "settings";
-  keywords?: Array<PluginLocalizedString | string>;
-  entry: string;
+  label: PluginLocalizedString;
+  description: PluginLocalizedString;
+  keywords?: PluginLocalizedString[];
+  icon: "palette";
+  themes: PluginScenicThemeCardContrib[];
+};
+
+export type PluginScenicThemeCardContrib = {
+  themeId: string;
+  label: PluginLocalizedString;
+  description: PluginLocalizedString;
+  previewAsset: string;
 };
 
 /** Wire format a contributed provider may declare. Absent means `chat_completions`. */
@@ -387,6 +493,17 @@ export type PluginProviderModelContrib = {
   maxTokens?: number;
   /** Whether the model accepts image input. */
   supportsImages?: boolean;
+  /**
+   * Thinking levels the picker may offer for this model, most restrictive
+   * first (e.g. `["off", "low", "high"]`). Names outside the canonical set are
+   * dropped. Omit for a model that exposes no reasoning control.
+   */
+  thinkingLevels?: string[];
+  /**
+   * Which of `thinkingLevels` a new session opens on. Ignored unless it names
+   * one of them. Omit to let the runtime pick the first available level.
+   */
+  defaultThinkingLevel?: string;
 };
 
 /**
@@ -548,6 +665,42 @@ export type PluginCommand = {
   keywords?: string[];
   category?: string;
   run: () => Promise<void> | void;
+};
+
+export type PluginSpeechRole = "transcribe" | "synthesize";
+
+export type PluginSpeechHandleInput = {
+  protocol: string;
+  role: PluginSpeechRole;
+  modelId: string;
+  voice?: string;
+  format?: string;
+  extra?: Record<string, string>;
+  text?: string;
+  language?: string;
+  audio?: { mimeType: string; data: string };
+};
+
+export type PluginSpeechHandleResult =
+  | { kind: "text"; text: string }
+  | { kind: "audio"; mimeType: string; data: string }
+  | {
+      kind: "http";
+      call: {
+        url: string;
+        method?: "GET" | "POST";
+        headers?: Record<string, string>;
+        body?: unknown;
+        parse: "bytes" | "json-text" | "json-path" | "openai-transcription" | "openai-chat-audio";
+        jsonPath?: string;
+      };
+    };
+
+export type PluginSpeechAdapter = {
+  protocol: string;
+  label: string;
+  roles: PluginSpeechRole[];
+  handle: (input: PluginSpeechHandleInput) => Promise<PluginSpeechHandleResult> | PluginSpeechHandleResult;
 };
 
 export type PluginTool = {
@@ -860,6 +1013,7 @@ export type PluginThemeSummary = {
 export type PluginHostApi = {
   app: {
     getVersion: () => Promise<string>;
+    /** Active app language. Plugin-owned UI localizes from this (ADR 0280). */
     getLocale: () => Promise<string>;
     getAppearance: () => Promise<PluginAppearance>;
     /**
@@ -885,6 +1039,10 @@ export type PluginHostApi = {
   commands: {
     register: (command: PluginCommand) => Promise<void>;
     unregister: (id: string) => Promise<void>;
+  };
+  speech: {
+    registerAdapter: (adapter: PluginSpeechAdapter) => Promise<void>;
+    unregisterAdapter: (protocol: string) => Promise<void>;
   };
   ui: {
     openPanel: (opts?: { title?: string }) => Promise<void>;
@@ -1014,6 +1172,28 @@ export type PluginHostApi = {
       mode?: "trash" | "purge";
     }) => Promise<{ deleted: boolean }>;
   };
+  /**
+   * Read-only completed-turn facts served by the host (`usage.read`). Flat
+   * counters and identifiers only — no message body, no write path, and no
+   * dashboard shape: streaks, heatmaps, and rankings stay the plugin's own
+   * computation on top of these rows.
+   */
+  usage: {
+    listTurns: (input?: {
+      /** Inclusive window start in epoch ms. Default: `toMs` minus 30 days. */
+      fromMs?: number;
+      /** Inclusive window end in epoch ms. Default: now. Window span ≤ 365 days. */
+      toMs?: number;
+      /** Limit rows to one durable project id. */
+      projectId?: number | null;
+      /** Limit rows to one session id. */
+      sessionId?: string;
+      /** Opaque page cursor from the previous `nextCursor`. */
+      cursor?: string;
+      /** 1..=500 rows per page; default 200. */
+      limit?: number;
+    }) => Promise<PluginUsageTurnPage>;
+  };
   services: {
     /**
      * Register a resident service declared in `contributes.services`. Local
@@ -1088,6 +1268,12 @@ export type PluginModule = {
   onUnload?: () => Promise<void> | void;
   /** Optional fixed-channel operations for an isolated plugin panel. */
   onPanelInvoke?: (channel: string, payload: unknown) => Promise<unknown> | unknown;
+  /**
+   * Answers the renderer entry's `plugin.call` for a method listed in
+   * `manifest.rendererCallMethods`. `args` defaults to `{}`; the answer must
+   * be JSON. Throw an `Error` with a `code` to hand that code to the caller.
+   */
+  onRendererCall?: (method: string, args: unknown) => Promise<unknown> | unknown;
 };
 
 /** Upper bound on ExtensionAPI modules one plugin may contribute. */
@@ -1112,6 +1298,10 @@ export const PLUGIN_PERMISSIONS = [
   "agent.prompt.inject",
   "agent.complete",
   "agent.extension",
+  // Renderer slots (`docs/plugin-plan/ui/`): the entry module loads into the
+  // host renderer's own document, so the surface it can touch is the
+  // renderer itself. One umbrella permission, like `agent.extension`.
+  "renderer.extension",
   "provider.register",
   "desktop.control",
   "models.list",
@@ -1121,7 +1311,14 @@ export const PLUGIN_PERMISSIONS = [
   "session.read.own",
   "session.update.own",
   "session.delete.own",
+  // Read-only usage facts (pi.usage.listTurns):
+  // completed-turn counters and session titles, never message bodies.
+  "usage.read",
+  // Install-time escape hatch from the net.domains allowlist (issue #1201):
+  // user-typed endpoints, e.g. a self-hosted server, that no manifest written
+  // ahead of time can name. Enforced by net-policy's grant-aware checks.
   "net.fetch",
+  "net.anyHost",
   "shell.openExternal",
   "mcp.server.local",
   "mcp.server.remote",
@@ -1133,6 +1330,7 @@ export const PLUGIN_PERMISSIONS = [
   // what a service may use with no page open.
   "audio.capture.background",
   "audio.playback.background",
+  "speech.adapter.register",
   "keyboard.globalShortcut",
   "net.websocket",
 ] as const;
@@ -1162,6 +1360,8 @@ export function validateManifest(raw: unknown): {
   }
   const mainError = relativePathError(m.main, "manifest.main");
   if (mainError) return { ok: false, error: mainError };
+  const rendererError = manifestRendererError(m);
+  if (rendererError) return { ok: false, error: rendererError };
   if (typeof m.schemaVersion !== "number") {
     return { ok: false, error: "manifest.schemaVersion is required" };
   }
@@ -1176,8 +1376,16 @@ export function validateManifest(raw: unknown): {
       return { ok: false, error: `manifest.${field} must be a non-empty string` };
     }
   }
+  const i18nError = manifestI18nError((m as Record<string, unknown>).i18n);
+  if (i18nError) return { ok: false, error: i18nError };
   const ui = m.ui as
-    | { title?: unknown; panel?: unknown }
+    | {
+        title?: unknown;
+        panel?: unknown;
+        shape?: unknown;
+        alwaysOnTop?: unknown;
+        resizable?: unknown;
+      }
     | null
     | undefined;
   if (ui !== undefined) {
@@ -1192,6 +1400,15 @@ export function validateManifest(raw: unknown): {
       }
       const panelError = relativePathError(ui.panel, "manifest.ui.panel");
       if (panelError) return { ok: false, error: panelError };
+    }
+    if (ui.shape !== undefined && ui.shape !== "panel" && ui.shape !== "widget") {
+      return { ok: false, error: "manifest.ui.shape must be \"panel\" or \"widget\"" };
+    }
+    for (const key of ["alwaysOnTop", "resizable"] as const) {
+      const value = ui[key];
+      if (value !== undefined && typeof value !== "boolean") {
+        return { ok: false, error: `manifest.ui.${key} must be a boolean` };
+      }
     }
   }
   const contributesError = validateContributions(m.contributes);
@@ -1497,6 +1714,15 @@ export function validateContributions(
       if (model.supportsImages !== undefined && typeof model.supportsImages !== "boolean") {
         return `provider "${provider.id}" model ${modelId} supportsImages must be a boolean`;
       }
+      if (
+        model.thinkingLevels !== undefined &&
+        (!Array.isArray(model.thinkingLevels) || model.thinkingLevels.some((level) => typeof level !== "string"))
+      ) {
+        return `provider "${provider.id}" model ${modelId} thinkingLevels must be an array of strings`;
+      }
+      if (model.defaultThinkingLevel !== undefined && typeof model.defaultThinkingLevel !== "string") {
+        return `provider "${provider.id}" model ${modelId} defaultThinkingLevel must be a string`;
+      }
     }
   }
 
@@ -1523,7 +1749,7 @@ export function validateContributions(
       const assetPaths = new Set<string>();
       for (const asset of theme.assets) {
         if (typeof asset !== "string" || !isThemeAssetPath(asset)) {
-          return `theme "${theme.id}" asset must be an absolute ${THEME_ASSET_EXTENSIONS.join(
+          return `theme "${theme.id}" asset must be a package-relative or absolute ${THEME_ASSET_EXTENSIONS.join(
             "/",
           )} path`;
         }
@@ -1548,17 +1774,26 @@ export function validateContributions(
     }
   }
 
-  const settingsDestinationIds = new Set<string>();
-  for (const destination of contributes.settingsDestinations ?? []) {
-    if (!destination || typeof destination !== "object") return "contributes.settingsDestinations entries must be objects";
-    if (typeof destination.id !== "string" || !/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(destination.id)) return "contributes.settingsDestinations id must match [a-zA-Z][a-zA-Z0-9_-]{0,63}";
-    if (settingsDestinationIds.has(destination.id)) return `duplicate settings destination id "${destination.id}"`;
-    settingsDestinationIds.add(destination.id);
-    if (typeof destination.entry !== "string" || !destination.entry.endsWith(".html")) return `settings destination "${destination.id}" entry must be an .html file`;
-    const pathError = relativePathError(destination.entry, `settings destination "${destination.id}" entry`);
-    if (pathError) return pathError;
-    if (!destination.label || (typeof destination.label !== "string" && typeof destination.label !== "object")) return `settings destination "${destination.id}" requires a label`;
-    if (!["sliders", "sparkles", "palette", "plug", "settings"].includes(destination.icon)) return `settings destination "${destination.id}" has an unsupported icon`;
+  const scenicThemes = contributes.scenicThemes;
+  if (scenicThemes !== undefined) {
+    if (!scenicThemes || typeof scenicThemes !== "object" || Array.isArray(scenicThemes)) return "contributes.scenicThemes must be an object";
+    if (typeof scenicThemes.id !== "string" || !/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(scenicThemes.id)) return "contributes.scenicThemes id must match [a-zA-Z][a-zA-Z0-9_-]{0,63}";
+    const localized = (value: unknown) => Boolean(value && typeof value === "object" && typeof (value as PluginLocalizedString).en === "string" && typeof (value as PluginLocalizedString)["zh-CN"] === "string");
+    if (!localized(scenicThemes.label)) return "contributes.scenicThemes requires a localized label";
+    if (!localized(scenicThemes.description)) return "contributes.scenicThemes requires a localized description";
+    if (scenicThemes.keywords !== undefined && (!Array.isArray(scenicThemes.keywords) || !scenicThemes.keywords.every(localized))) return "contributes.scenicThemes keywords must be localized";
+    if (scenicThemes.icon !== "palette") return "contributes.scenicThemes has an unsupported icon";
+    if (!Array.isArray(scenicThemes.themes) || scenicThemes.themes.length < 1 || scenicThemes.themes.length > 12) return "contributes.scenicThemes themes must contain 1 to 12 cards";
+    const themeIds = new Set<string>();
+    for (const card of scenicThemes.themes) {
+      if (!card || typeof card !== "object") return "contributes.scenicThemes theme cards must be objects";
+      if (typeof card.themeId !== "string" || !/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(card.themeId)) return "contributes.scenicThemes card themeId must be valid";
+      if (themeIds.has(card.themeId)) return `contributes.scenicThemes duplicates themeId "${card.themeId}"`;
+      themeIds.add(card.themeId);
+      if (!localized(card.label)) return "contributes.scenicThemes card requires a localized label";
+      if (!localized(card.description)) return "contributes.scenicThemes card requires a localized description";
+      if (typeof card.previewAsset !== "string" || !isThemeAssetPath(card.previewAsset)) return "contributes.scenicThemes card previewAsset must be an image path";
+    }
   }
 
   const windowAppearance = contributes.windowAppearance;
@@ -1729,6 +1964,69 @@ function manifestAuthorError(value: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * `manifest.i18n` is display metadata: locale id → the strings that locale
+ * shows. Shape errors are refused because a malformed block would silently
+ * leave the shell on the author's own language with no way to tell why; a
+ * locale or field a plugin does not translate is fine and falls back.
+ */
+function manifestI18nError(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return "manifest.i18n must be an object of locale → { name?, description?, safetyNotes? }";
+  }
+  for (const [locale, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return `manifest.i18n.${locale} must be an object`;
+    }
+    for (const field of ["name", "description", "safetyNotes"] as const) {
+      const text = (entry as Record<string, unknown>)[field];
+      if (text !== undefined && typeof text !== "string") {
+        return `manifest.i18n.${locale}.${field} must be a string`;
+      }
+    }
+  }
+  return undefined;
+}
+
+/** Upper bounds for the renderer-slot declarations one plugin may carry. */
+export const MAX_RENDERER_ACTIONS_PER_PLUGIN = 16;
+export const MAX_RENDERER_CALL_METHODS_PER_PLUGIN = 32;
+
+/**
+ * `manifest.renderer` and its two whitelists. The entry is a relative
+ * `.js`/`.mjs` module, the whitelists are bounded arrays of non-empty strings
+ * that mean nothing without the entry, and any of it requires the
+ * `renderer.extension` permission. Unknown action words are accepted here so a
+ * manifest written for a newer host still loads; dispatch refuses them.
+ */
+function manifestRendererError(m: Partial<PluginManifest>): string | undefined {
+  for (const [field, max] of [
+    ["rendererActions", MAX_RENDERER_ACTIONS_PER_PLUGIN],
+    ["rendererCallMethods", MAX_RENDERER_CALL_METHODS_PER_PLUGIN],
+  ] as const) {
+    const value: unknown = m[field];
+    if (value === undefined) continue;
+    if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || !entry.trim())) {
+      return `manifest.${field} must be an array of non-empty strings`;
+    }
+    if (value.length > max) return `manifest.${field} allows at most ${max} entries`;
+  }
+  const declaresWhitelist = Boolean(m.rendererActions?.length || m.rendererCallMethods?.length);
+  if (m.renderer === undefined && !declaresWhitelist) return undefined;
+  if (!m.permissions?.includes("renderer.extension")) {
+    return "renderer modules require the renderer.extension permission";
+  }
+  if (m.renderer === undefined) return "renderer whitelists require manifest.renderer";
+  if (typeof m.renderer !== "string" || !m.renderer.trim()) {
+    return "manifest.renderer must be a non-empty string";
+  }
+  const pathError = relativePathError(m.renderer, "manifest.renderer");
+  if (pathError) return pathError;
+  if (!/\.m?js$/.test(m.renderer)) return "manifest.renderer must be a .js or .mjs module";
+  return undefined;
+}
+
 function relativePathError(value: string, field: string): string | undefined {
   if (/^[a-zA-Z]:[\\/]/.test(value) || value.startsWith("/") || value.startsWith("\\")) {
     return `${field} must not be an absolute path`;
@@ -1824,11 +2122,14 @@ export {
 } from "./mcp-config.js";
 export {
   isLocalNetDomain,
+  isMetadataNetHost,
   isNetHostAllowed,
+  isNetSocketUrlAllowedWithGrant,
   isNetUrlAllowed,
-  isNetSocketUrlAllowed,
+  isNetUrlAllowedWithGrant,
   parseNetDomains,
   type PluginNetDomain,
+  type PluginNetEgressGrant,
 } from "./net-policy.js";
 export {
   fsGlobIgnoresCase,
@@ -1850,3 +2151,72 @@ export {
   type PluginFsRule,
   type ResolvedFsAccess,
 } from "./fs-policy.js";
+
+export {
+  PLUGIN_RENDERER_SCHEME,
+  PLUGIN_RENDERER_SLOTS,
+  PLUGIN_SLOT_POSITIONS,
+  PLUGIN_RENDERER_ACTIONS,
+  PLUGIN_INSERT_TEXT_MAX_BYTES,
+  blockRendererLanguageKey,
+  slotRegistrationRefusal,
+  type PiRendererApi,
+  type PiRendererModule,
+  type PluginRendererSlot,
+  type PluginSlotPosition,
+  type PluginSlotMessage,
+  type PluginActionSlotProps,
+  type PluginEntryExtraSlotProps,
+  type PluginToolCardStatus,
+  type PluginToolCardSlotProps,
+  type PluginBlockRendererSlotProps,
+  type PluginComposerControlSlotProps,
+  type PluginSlotComponent,
+  type PluginActionSlotRegistration,
+  type PluginEntryExtraSlotRegistration,
+  type PluginToolCardSlotRegistration,
+  type PluginBlockRendererSlotRegistration,
+  type PluginComposerControlSlotRegistration,
+  type PluginSlotRegistration,
+  type PluginDisposer,
+  type PluginLayer,
+  type PluginRendererActionName,
+  type PluginRendererActionMap,
+  type PluginRendererDispatch,
+  type PluginCallPayload,
+  type PluginInsertTextPayload,
+  type PluginSlotErrorCode,
+  type PluginRendererErrorCode,
+  type PluginSlotRefusal,
+  type PluginComponentSlot,
+} from "./renderer.js";
+
+export {
+  PLUGIN_COMPOSER_TRIGGERS,
+  PLUGIN_TRIGGER_MAX_ITEMS,
+  PLUGIN_TRIGGER_TIMEOUT_MS,
+  PLUGIN_MARK_LABEL_MAX_CHARS,
+  PLUGIN_TRIGGER_DETAIL_MAX_CHARS,
+  PLUGIN_MARK_SEND_MAX_BYTES,
+  PLUGIN_DRAFT_MAX_MARKS,
+  PLUGIN_DRAFT_TEXT_MAX_BYTES,
+  PLUGIN_DRAFT_MARK_CHAR,
+  PLUGIN_ATTACHMENT_MAX_BYTES,
+  PLUGIN_ATTACHMENTS_MAX,
+  composerTriggerKey,
+  type PluginComposerTrigger,
+  type PluginTriggerQuery,
+  type PluginTriggerItem,
+  type PluginComposerTriggerRegistration,
+  type PluginDraftMark,
+  type PluginDraftSnapshot,
+  type PluginDraftMarkInput,
+  type PluginReadDraftPayload,
+  type PluginReplaceDraftPayload,
+  type PluginDraftWriteResult,
+  type PluginAttachmentAddPayload,
+  type PluginAttachmentRef,
+  type PluginAttachment,
+  type PluginAttachmentListPayload,
+  type PluginDraftListener,
+} from "./renderer-composer.js";

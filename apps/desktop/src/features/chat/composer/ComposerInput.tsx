@@ -1,3 +1,5 @@
+import { useLayoutEffect } from "react";
+import { installComposerDeletionGuard } from "./native-deletion";
 import type {
   ClipboardEvent,
   Dispatch,
@@ -6,12 +8,13 @@ import type {
   RefObject,
   SetStateAction,
 } from "react";
-import type { useComposerAutocomplete } from "../../../hooks/use-composer-autocomplete";
 import { editorSelectionRange, readEditorValue } from "./editor";
-
-type AutocompleteController = ReturnType<typeof useComposerAutocomplete>;
+import { ComposerImagePreview } from "./ComposerImagePreview";
+import type { CompletionController } from "./hooks/useComposerCompletions";
+import type { ComposerImagePreviewController } from "./hooks/useComposerImagePreview";
 
 export type ComposerInputProps = {
+  imagePreview?: ComposerImagePreviewController;
   inputRef: RefObject<HTMLDivElement | null>;
   value: string;
   placeholderText: string;
@@ -20,20 +23,30 @@ export type ComposerInputProps = {
   pasting: boolean;
   enterToSend: boolean;
   runActive: boolean;
-  composerAc: AutocompleteController;
+  composerAc: CompletionController;
   onPaste: (event: ClipboardEvent<HTMLDivElement>) => void;
   onAcceptCompletion: (index: number) => void;
   onSubmit: (steering?: boolean) => void;
   onInsertNewline: () => void;
   onInput: (source: string, caret: number) => void;
+  /** Terminal-style recall; returns true when the arrow key was consumed. */
+  onHistoryNavigate: (direction: "older" | "newer") => boolean;
   onCompositionStart: () => void;
   onCompositionEnd: (event: FormEvent<HTMLDivElement>) => void;
+  /**
+   * A composition that the browser never reports as ended. A Windows Chinese
+   * IME drops `compositionend` when the composing text is deleted, which
+   * would otherwise leave the draft composing forever (#929). An input event
+   * that is not part of a composition is proof it is over.
+   */
+  onSettledInput: () => void;
   onFocus: () => void;
   onBlur: () => void;
 };
 
 /** Rich contenteditable input; draft state and async operations stay outside. */
 export function ComposerInput({
+  imagePreview,
   inputRef,
   value,
   placeholderText,
@@ -48,13 +61,20 @@ export function ComposerInput({
   onSubmit,
   onInsertNewline,
   onInput,
+  onHistoryNavigate,
   onCompositionStart,
   onCompositionEnd,
+  onSettledInput,
   onFocus,
   onBlur,
 }: ComposerInputProps) {
+  useLayoutEffect(() => {
+    const editor = inputRef.current;
+    return editor ? installComposerDeletionGuard(editor) : undefined;
+  }, [inputRef]);
   return (
     <div className="composer-input-wrap">
+      {imagePreview ? <ComposerImagePreview controller={imagePreview} /> : null}
       <div className="composer-input-stage">
         {/* React does not render children into this node; the editor module
           paints atomic attachment chips imperatively. */}
@@ -87,6 +107,9 @@ export function ComposerInput({
             const element = event.currentTarget;
             const source = readEditorValue(element);
             const { start } = editorSelectionRange(element);
+            // An input outside a composition proves the previous one ended,
+            // even when the IME never sent compositionend (#929).
+            if (!(event.nativeEvent as InputEvent).isComposing) onSettledInput();
             onInput(source, start);
           }}
           onCompositionStart={onCompositionStart}
@@ -124,6 +147,17 @@ export function ComposerInput({
                 onAcceptCompletion(composerAc.highlight);
                 return;
               }
+            }
+            if (
+              (event.key === "ArrowUp" || event.key === "ArrowDown") &&
+              !event.shiftKey &&
+              !event.altKey &&
+              !event.metaKey &&
+              !event.ctrlKey &&
+              onHistoryNavigate(event.key === "ArrowUp" ? "older" : "newer")
+            ) {
+              event.preventDefault();
+              return;
             }
             if (
               event.key === "Enter" &&

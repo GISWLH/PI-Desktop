@@ -1,11 +1,12 @@
 import { dialog, globalShortcut, shell, type BrowserWindow } from "electron";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import {
   IPC,
+  ErrorCodes,
   type ActivationScope,
   type AppSettings,
   type BrowserState,
+  type McpServerStatus,
   type ModelBinding,
   type ShortcutPlatform,
   type ThinkingLevel,
@@ -32,6 +33,7 @@ import { createFsConsentService } from "../plugin-fs-consent";
 import { pluginWorkspaceInfo } from "../workspace-roots";
 import { createDesktopConsentService } from "../plugin-desktop-consent";
 import { PluginRuntime } from "../plugin-runtime";
+import { createSpeechService } from "./speech-service";
 import { PluginShortcutRegistry } from "../plugin-shortcut-registry";
 import { PluginWebSocketRegistry } from "../plugin-websocket";
 import { hostGlobalShortcutBindings } from "../bootstrap/launcher";
@@ -39,14 +41,15 @@ import { UserMcpRuntime } from "../user-mcp";
 import {
   MCP_CALL_TIMEOUT_MS,
   MCP_CONNECT_TIMEOUT_MS,
+  MCP_TOOL_DISCOVERY_TIMEOUT_MS,
   McpServerClient,
 } from "../plugin-mcp";
+import { McpOAuthManager } from "../mcp-oauth";
 import { PluginPanelHost } from "../plugin-panel-host";
 import { PluginViewHost } from "../plugin-view-host";
 import { BrowserPane } from "../browser-view";
 import { BrowserHost, BROWSER_PLUGIN_ID } from "../browser-host";
 import { OAUTH_AUTH_KIND, type VendorOAuth } from "../oauth";
-import type { AgentExtensionBridge } from "../agent-extensions";
 import type { ClipboardHistory } from "../clipboard-history";
 import type { TurnEndedPayload } from "../runtime/session-coordination";
 import type { HostProcess } from "../host-process";
@@ -71,10 +74,8 @@ export type PluginServicesDependencies = {
   getPluginPanelTheme: () => "light" | "dark";
   getAppearance: () => PluginAppearance;
   getWorkspacePath: () => string | null;
-  isHostUnavailable: (error: unknown) => boolean;
   resolveAgentRuntimeLaunch: (...args: any[]) => Promise<any>;
   vendorOAuth: VendorOAuth;
-  agentExtensions: AgentExtensionBridge;
 };
 
 export function createPluginServices({
@@ -93,11 +94,13 @@ export function createPluginServices({
   getPluginPanelTheme,
   getAppearance,
   getWorkspacePath,
-  isHostUnavailable,
   resolveAgentRuntimeLaunch,
   vendorOAuth,
-  agentExtensions,
 }: PluginServicesDependencies) {
+  // A plugin request can lose its race with host shutdown or restart.
+  const isHostUnavailable = (error: unknown): boolean =>
+    (error as { errorCode?: string } | null | undefined)?.errorCode ===
+    ErrorCodes.HOST_UNAVAILABLE;
   const pluginPanels = new PluginPanelHost(
     async (pluginId, channel, payload, context) =>
       plugins.invokePanelBridge(pluginId, channel, payload, context),
@@ -181,7 +184,6 @@ export function createPluginServices({
       globalShortcut.unregister(accelerator);
     },
     // Late-bound: the runtime is constructed just below, and a trigger can
-    // Late-bound: the runtime is constructed just below, and a trigger can
     // only arrive once the app is running and a plugin holds a shortcut.
     onTrigger: (entry) => {
       void plugins.triggerPluginShortcut(entry);
@@ -210,8 +212,18 @@ export function createPluginServices({
         message: `${input.title}${input.body ? `: ${input.body}` : ""}`,
       }),
     getNotificationPermission: getPluginNotificationPermission,
-    requestNotificationPermission: requestPluginNotificationPermission,
-    showNativeNotification: showPluginNativeNotification,
+    requestNotificationPermission: async () => {
+      const permission = await requestPluginNotificationPermission();
+      if (permission === "granted") {
+        sendToRenderer(IPC.event.notificationSound, {});
+      }
+      return permission;
+    },
+    showNativeNotification: async (input) => {
+      const result = await showPluginNativeNotification(input);
+      if (result.shown) sendToRenderer(IPC.event.notificationSound, {});
+      return result;
+    },
     openExternal: async (url) => {
       await safeOpenExternal(url);
     },
@@ -337,6 +349,13 @@ export function createPluginServices({
     project: {
       create: (pluginId, input) => callPluginProjectHost(pluginId, input),
     },
+    // Read-only usage facts: the same host-owned session transport, no
+    // mutation, so no `sessionsChanged` fan-out (callPluginSessionHost only
+    // announces the mutating methods).
+    usage: {
+      listTurns: (pluginId, input) =>
+        callPluginSessionHost("plugin.usage.listTurns", pluginId, input),
+    },
     complete: async (input): Promise<PluginCompleteResult> => {
       if (!getHost()) {
         throw Object.assign(new Error("host unavailable"), { code: "UNSUPPORTED" });
@@ -384,7 +403,14 @@ export function createPluginServices({
         runtimeProvider,
         context,
         launch.sidecarParams.thinkingLevel,
-        { signal: input.signal, sessionId: launchSessionId },
+        {
+          signal: input.signal,
+          sessionId: launchSessionId,
+          // Spec 07-plugins/03-plugin-api.md: empty model output answers the
+          // plugin with INVALID_ARGUMENT, not the runtime's internal code.
+          emptyErrorCode: "INVALID_ARGUMENT",
+          emptyErrorMessage: "The model returned no text.",
+        },
       );
       return {
         text: result.text,
@@ -395,11 +421,14 @@ export function createPluginServices({
     },
     // A plugin host process dying is contained: contributions are already
     // deregistered by the runtime, we only have to tell the user and the UI.
-    onPluginCrash: ({ pluginId, exitCode }) => {
+    onPluginCrash: ({ pluginId, exitCode, exitCodeHex }) => {
       logger.app("plugin", "error", "plugin host process crashed", {
         pluginId,
         code: "PLUGIN_CRASHED",
-        data: { exitCode },
+        data: {
+          exitCode,
+          ...(exitCodeHex ? { exitCodeHex } : {}),
+        },
       });
       // No toast here: the runtime already raised one through `showToast` on the
       // same code path, and a second identical message reads as two failures.
@@ -407,7 +436,6 @@ export function createPluginServices({
       // surface. Drop it; the renderer re-opens it on the pluginChanged event if
       // the tab is still active and the plugin came back.
       pluginViews.closePlugin(pluginId);
-      pluginSettingsViews.closePlugin(pluginId);
       if (pluginId === BROWSER_PLUGIN_ID) browserHost.disposeGuest();
       sendToRenderer(IPC.event.pluginChanged,{ reason: "crash", pluginId });
     },
@@ -425,7 +453,7 @@ export function createPluginServices({
     },
     // Hot reload happens without anyone asking for it, so it has to report
     // itself: the plugins page reads status from the host, not from the edit.
-    onPluginReloaded: ({ pluginId, name, ok, message }) => {
+    onPluginReloaded: async ({ pluginId, name, ok, message }) => {
       logger.app("plugin", ok ? "info" : "error", "development plugin reloaded", {
         pluginId,
         data: { ok, message },
@@ -433,17 +461,44 @@ export function createPluginServices({
       sendToRenderer(IPC.event.toast, {
         message: ok ? `Reloaded ${name}` : `Reload failed: ${name} — ${message ?? ""}`,
       });
-      // Views were loaded from the previous revision of the plugin's files.
+      // Views and panels were loaded from the previous revision of the plugin's files.
       pluginViews.closePlugin(pluginId);
-      pluginSettingsViews.closePlugin(pluginId);
+      await pluginPanels.close(pluginId, { force: true });
       if (pluginId === BROWSER_PLUGIN_ID) browserHost.disposeGuest();
       sendToRenderer(IPC.event.pluginChanged,{ reason: "reload", pluginId });
     },
   });
-  const userMcp = new UserMcpRuntime({
+  let userMcp: UserMcpRuntime;
+  const mcpOAuth: McpOAuthManager = new McpOAuthManager({
+    call: async (method, params) => {
+      const h = getHost();
+      if (!h) throw new Error("host unavailable");
+      return h.call(method, params);
+    },
+    emit: (event) => sendToRenderer(IPC.event.mcpOauth, event),
+    openExternal: (url) => safeOpenExternal(url),
+    log: (level, message, data) => logger.app("plugin", level, message, { data }),
+    onAuthorized: async (serverId, record): Promise<McpServerStatus> => {
+      const existed = userMcp.listRecords().some((item) => item.id === serverId);
+      if (record && !existed) {
+        userMcp.setRecords([...userMcp.listRecords(), record]);
+      }
+      userMcp.invalidate(serverId);
+      const status: McpServerStatus = await userMcp.test(serverId);
+      if (!existed) {
+        userMcp.invalidate(serverId);
+        userMcp.setRecords(userMcp.listRecords().filter((item) => item.id !== serverId));
+      }
+      sendToRenderer(IPC.event.pluginChanged, { reason: "mcp", pluginId: serverId });
+      return status;
+    },
+  });
+  userMcp = new UserMcpRuntime({
     createClient: (config) => new McpServerClient(config),
+    oauth: mcpOAuth,
     connectTimeoutMs: MCP_CONNECT_TIMEOUT_MS,
     callTimeoutMs: MCP_CALL_TIMEOUT_MS,
+    discoveryTimeoutMs: MCP_TOOL_DISCOVERY_TIMEOUT_MS,
     audit: (entry) => logger.app("plugin", "info", "mcp.api", entry),
     log: (level, message, data) => logger.app("plugin", level, message, { data }),
   });
@@ -502,7 +557,6 @@ export function createPluginServices({
       });
     }
   };
-  const browserPane = new BrowserPane(emitBrowserState);
   const pluginViews = new PluginViewHost(({ pluginId, url }) => {
     logger.app("plugin", "warn", "plugin.api", {
       pluginId,
@@ -510,19 +564,19 @@ export function createPluginServices({
       data: { api: "view.egress", ok: false, url, ts: Date.now() },
     });
   });
-  // Settings extensions use the same sandboxed preload and egress policy as
-  // work-panel views, but have their own visible surface and lifecycle.
-  const pluginSettingsViews = new PluginViewHost(({ pluginId, url }) => {
-    logger.app("plugin", "warn", "plugin.api", {
-      pluginId,
-      code: "PERMISSION_DENIED",
-      data: { api: "settings.egress", ok: false, url, ts: Date.now() },
-    });
-  });
   pluginPanels.addSenderResolver((senderId) => pluginViews.pluginIdForSender(senderId));
-  pluginPanels.addSenderResolver((senderId) => pluginSettingsViews.pluginIdForSender(senderId));
   const browserHost = new BrowserHost({
-    pane: browserPane,
+    createPane: (onState, onOpenUrl) => new BrowserPane(onState, onOpenUrl),
+    onOpenUrl: (url, sessionId) => {
+      void (async () => {
+        const settings = await getHost()?.call<AppSettings>("settings.get");
+        if (!sessionId || settings?.linkOpenTarget === "external" || !/^https?:/i.test(url)) {
+          await shell.openExternal(url);
+        } else {
+          sendToRenderer(IPC.event.browserPreview, { sessionId, url });
+        }
+      })().catch((error) => logger.app("plugin", "warn", "browser.link.open.failed", { data: String(error) }));
+    },
     isPluginLoaded: (pluginId) => Boolean(plugins.getLoaded(pluginId)),
     getFileRoot: async (sessionId) => {
       if (sessionId) {
@@ -540,10 +594,7 @@ export function createPluginServices({
     },
     getScratchDir: (sessionId) => {
       if (!sessionId) return null;
-      const root =
-        process.env.PI_DESKTOP_DATA_DIR?.trim() ||
-        join(homedir(), ".pi-desktop");
-      return join(root, "scratch", sessionId);
+      return join(dataDir, "scratch", sessionId);
     },
     onState: emitBrowserState,
   });
@@ -554,18 +605,25 @@ export function createPluginServices({
     /**
      * The richer workspace payload, so `pi.workspace.get` and the
      * `workspace:changed` event both expose the open project's folder roots
-     * (ADR 0252) instead of the bare primary path.
+     * (ADR 0263) instead of the bare primary path.
      */
     getWorkspaceInfo: () => pluginWorkspaceInfo(getWorkspacePath()),
+    /**
+     * The project each live session belongs to, so an fs call made by one
+     * session's tool follows that session instead of whichever project the
+     * window happens to be showing (ADR 0016, D093). Cold for a session whose
+     * runtime has not launched yet, which falls back to the visible workspace.
+     */
+    getWorkspacePathForSession: (sessionId) => sessionProjects.get(sessionId) ?? null,
     agentExtensionsChanged: () =>
       sendToRenderer(IPC.event.pluginChanged, { reason: "agentExtensions" }),
     browser: {
-      navigate: (input, sessionId) => browserHost.navigate(input, sessionId),
-      action: (action) => browserHost.action(action),
+      navigate: (input, sessionId, tabId) => browserHost.navigate(input, sessionId, tabId),
+      action: (action, sessionId, tabId) => browserHost.action(action, sessionId, tabId),
       setBounds: (pluginId, hole) => browserHost.setGuestHole(pluginId, hole),
       setVisible: (pluginId, visible) => browserHost.setGuestVisible(pluginId, visible),
       getState: () => browserHost.getState(),
-      openExternal: () => browserHost.openExternal(),
+      openExternal: (sessionId, tabId) => browserHost.openExternal(sessionId, tabId),
       snapshot: () => browserHost.snapshot(),
       screenshot: (input, sessionId) => browserHost.screenshot(input, sessionId),
       click: (uid) => browserHost.click(uid),
@@ -578,17 +636,23 @@ export function createPluginServices({
       if (pluginId === BROWSER_PLUGIN_ID) browserHost.disposeGuest();
     },
   });
+  const speech = createSpeechService({
+    dataDir,
+    getHost,
+    plugins,
+    logger,
+  });
   return {
     plugins,
     userMcp,
+    mcpOAuth,
     pluginScopes,
     sessionProjects,
     emitBrowserState,
     announceTurnEnded,
     pluginPanels,
     pluginViews,
-    pluginSettingsViews,
     browserHost,
-    browserPane,
+    speech,
   };
 }

@@ -13,7 +13,7 @@ test("high-traffic chrome uses shared motion tokens on hover fills", () => {
     ".search-item",
     ".footer-action",
     ".notification-item",
-    ".work-panel-subagent-back",
+    ".work-panel-tab-close",
   ]) {
     // Match the selector anywhere in a rule's selector list, and require the
     // transition inside that rule's own body — a shared list is as valid as a
@@ -26,7 +26,9 @@ test("high-traffic chrome uses shared motion tokens on hover fills", () => {
 });
 
 test("empty-home stack gap stays within the 24px workstation ceiling", () => {
-  const block = styles.match(/\.home-stack-inner\s*\{[^}]+\}/)?.[0] ?? "";
+  // The resizing override also mentions `.home-stack-inner`; pin the
+  // standalone rule so this check does not bind to `transition: none`.
+  const block = styles.match(/^\.home-stack-inner\s*\{[\s\S]*?\}/m)?.[0] ?? "";
   assert.match(block, /gap:\s*(?:1[0-9]px|2[0-4]px)/);
   assert.doesNotMatch(block, /gap:\s*2[5-9]px|gap:\s*[3-9]\dpx/);
 });

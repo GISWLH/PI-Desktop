@@ -1,6 +1,9 @@
-import { Button, cx } from "../../components/ui";
+import { Button, SettingsToggle, cx, portalOverlay } from "../../components/ui";
 import { IconCheck, IconShield, IconSparkles, IconTriangleAlert } from "../../components/icons";
+import { PluginInstallDialog } from "../../components/plugins/PluginInstallDialog";
 import { PluginSettingsSheet } from "../../components/plugins/PluginSettingsSheet";
+import { useBlockingOverlay } from "../../lib/blocking-overlay";
+import type { ReactNode } from "react";
 import { useAppStore } from "../../stores/app-store";
 import {
   RISK_LABEL_KEYS,
@@ -11,14 +14,30 @@ import {
 } from "./model";
 import type { PluginsPageModel } from "./usePluginsPage";
 
+function pluginModalPortal(node: ReactNode) {
+  return portalOverlay(<PluginModalBlockingHost>{node}</PluginModalBlockingHost>);
+}
+
+function PluginModalBlockingHost({ children }: { children: ReactNode }) {
+  useBlockingOverlay();
+  return <>{children}</>;
+}
+
 export function PluginDialogs({
   t,
   pendingInstall,
   setPendingInstall,
+  pendingReview,
+  setPendingReview,
+  confirmReview,
   autoUpdate,
   setAutoUpdate,
   busyId,
   confirmInstall,
+  installJob,
+  cancelInstallDownload,
+  retryInstall,
+  closeInstallDialog,
   settingsPlugin,
   setSettingsPlugin,
   refreshPlugins,
@@ -29,7 +48,65 @@ export function PluginDialogs({
 }: PluginsPageModel) {
   return (
     <>
-    {pendingInstall ? (
+      {pendingReview
+        ? pluginModalPortal(
+        <div className="plugins-modal-backdrop" role="presentation">
+          <div
+            className="plugins-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={t("plugins.permissionReview")}
+          >
+            <header className="plugins-modal-head">
+              <span className="plugins-modal-icon" aria-hidden>
+                <IconShield size={17} />
+              </span>
+              <div>
+                <h2 className="plugins-modal-title">
+                  {t(
+                    pendingReview.kind === "reload"
+                      ? "plugins.devReviewNewTitle"
+                      : "plugins.devReviewTitle",
+                    { name: pendingReview.name },
+                  )}
+                </h2>
+                {pendingReview.version ? (
+                  <p className="plugins-modal-subtitle">
+                    {t("plugins.installingVersion", { version: pendingReview.version })}
+                  </p>
+                ) : null}
+              </div>
+            </header>
+
+            <div className="plugins-modal-body">
+              <p className="plugins-modal-lede">{t("plugins.devReviewBody")}</p>
+              <PermissionGroups
+                t={t}
+                permissions={pendingReview.permissions}
+                newPermissions={pendingReview.addedPermissions}
+              />
+            </div>
+
+            <div className="plugins-modal-actions">
+              <Button variant="secondary" onClick={() => setPendingReview(null)}>
+                {t("plugins.cancel")}
+              </Button>
+              <Button
+                variant="primary"
+                disabled={busyId === pendingReview.id}
+                onClick={() => void confirmReview()}
+              >
+                {busyId === pendingReview.id
+                  ? t("plugins.devReviewLoading")
+                  : t("plugins.devReviewAccept")}
+              </Button>
+            </div>
+          </div>
+        </div>,
+      )
+        : null}
+      {pendingInstall
+        ? pluginModalPortal(
         <div className="plugins-modal-backdrop" role="presentation">
           <div
             className="plugins-modal"
@@ -55,66 +132,19 @@ export function PluginDialogs({
 
             <div className="plugins-modal-body">
               <p className="plugins-modal-lede">{t("plugins.permissionReviewBody")}</p>
-              {pendingInstall.permissions.length === 0 ? (
-                <p className="plugins-modal-lede">{t("plugins.noPermissions")}</p>
-              ) : (
-                RISK_TIERS.map((tier) => {
-                  const scoped = pendingInstall.permissions.filter(
-                    (permission) => permissionRisk(permission) === tier,
-                  );
-                  if (!scoped.length) return null;
-                  return (
-                    <div key={tier} className={cx("plugins-risk-group", `risk-${tier}`)}>
-                      <div className="plugins-risk-head">
-                        {tier === "high" ? (
-                          <IconTriangleAlert size={13} />
-                        ) : (
-                          <IconShield size={13} />
-                        )}
-                        {t(RISK_LABEL_KEYS[tier])}
-                        <span className="plugins-risk-count">{scoped.length}</span>
-                      </div>
-                      <ul className="plugins-perm-list is-plain">
-                        {scoped.map((permission) => (
-                          <li key={permission}>
-                            <span className="plugins-perm-copy">
-                              <strong>
-                                {permissionLabel(permission, t)}
-                                {pendingInstall.newPermissions.includes(permission) ? (
-                                  <span className="plugins-tag is-update">
-                                    {t("plugins.newPermission")}
-                                  </span>
-                                ) : null}
-                              </strong>
-                              <span>
-                                {t(`plugins.permissionHelp.${permission}`, {
-                                  defaultValue: permission,
-                                })}
-                              </span>
-                            </span>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  );
-                })
-              )}
+              <PermissionGroups
+                t={t}
+                permissions={pendingInstall.permissions}
+                newPermissions={pendingInstall.newPermissions}
+              />
             </div>
 
             <div className="plugins-switch-row">
-              <span className="plugins-switch-label">
-                {t("plugins.enableAutoUpdateOnInstall")}
-              </span>
-              <button
-                type="button"
-                className={cx("settings-toggle", autoUpdate && "on")}
-                role="switch"
-                aria-checked={autoUpdate}
-                aria-label={t("plugins.enableAutoUpdateOnInstall")}
-                onClick={() => setAutoUpdate((on) => !on)}
-              >
-                <span className="settings-toggle-thumb" />
-              </button>
+              <SettingsToggle
+                checked={autoUpdate}
+                label={t("plugins.enableAutoUpdateOnInstall")}
+                onChange={() => setAutoUpdate((on) => !on)}
+              />
             </div>
 
             <div className="plugins-modal-actions">
@@ -132,8 +162,17 @@ export function PluginDialogs({
               </Button>
             </div>
           </div>
-        </div>
-    ) : null}
+        </div>,
+      )
+        : null}
+      {installJob ? (
+        <PluginInstallDialog
+          job={installJob}
+          onCancel={cancelInstallDownload}
+          onRetry={retryInstall}
+          onClose={closeInstallDialog}
+        />
+      ) : null}
       {settingsPlugin ? (
         <PluginSettingsSheet
           plugin={settingsPlugin}
@@ -148,7 +187,8 @@ export function PluginDialogs({
           }}
         />
       ) : null}
-      {templatePick ? (
+      {templatePick
+        ? pluginModalPortal(
         <div className="plugins-modal-backdrop" role="presentation">
           <div
             className="plugins-modal"
@@ -164,14 +204,10 @@ export function PluginDialogs({
                 <h2 className="plugins-modal-title">
                   {t("plugins.newFromTemplateTitle")}
                 </h2>
-                <p className="plugins-modal-subtitle">
-                  {t("plugins.newFromTemplateHint")}
-                </p>
               </div>
             </header>
 
             <div className="plugins-modal-body">
-              <p className="plugins-modal-lede">{t("plugins.newFromTemplateBody")}</p>
               <div
                 className="plugins-template-list"
                 role="radiogroup"
@@ -208,6 +244,7 @@ export function PluginDialogs({
             <div className="plugins-modal-actions">
               <Button
                 variant="secondary"
+                data-action="cancel"
                 disabled={creating}
                 onClick={() => setTemplatePick(null)}
               >
@@ -224,8 +261,73 @@ export function PluginDialogs({
               </Button>
             </div>
           </div>
-        </div>
-      ) : null}
+        </div>,
+      )
+        : null}
+    </>
+  );
+}
+
+/**
+/**
+ * One permission list, shared by the install review and the development review:
+ * both answer the same question, so they must not drift into two renderings of
+ * the same risk data.
+ */
+function PermissionGroups({
+  t,
+  permissions,
+  newPermissions,
+}: {
+  t: PluginsPageModel["t"];
+  permissions: string[];
+  newPermissions: string[];
+}) {
+  if (!permissions.length) {
+    return <p className="plugins-modal-lede">{t("plugins.noPermissions")}</p>;
+  }
+  return (
+    <>
+      {RISK_TIERS.map((tier) => {
+        const scoped = permissions.filter(
+          (permission) => permissionRisk(permission) === tier,
+        );
+        if (!scoped.length) return null;
+        return (
+          <div key={tier} className={cx("plugins-risk-group", `risk-${tier}`)}>
+            <div className="plugins-risk-head">
+              {tier === "high" ? (
+                <IconTriangleAlert size={13} />
+              ) : (
+                <IconShield size={13} />
+              )}
+              {t(RISK_LABEL_KEYS[tier])}
+              <span className="plugins-risk-count">{scoped.length}</span>
+            </div>
+            <ul className="plugins-perm-list is-plain">
+              {scoped.map((permission) => (
+                <li key={permission}>
+                  <span className="plugins-perm-copy">
+                    <strong>
+                      {permissionLabel(permission, t)}
+                      {newPermissions.includes(permission) ? (
+                        <span className="plugins-tag is-update">
+                          {t("plugins.newPermission")}
+                        </span>
+                      ) : null}
+                    </strong>
+                    <span>
+                      {t(`plugins.permissionHelp.${permission}`, {
+                        defaultValue: permission,
+                      })}
+                    </span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        );
+      })}
     </>
   );
 }

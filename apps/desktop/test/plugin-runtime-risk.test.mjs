@@ -10,10 +10,10 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { en } from "../../../packages/i18n/src/locales/en/index.ts";
-import { zhCN } from "../../../packages/i18n/src/locales/zh-CN/index.ts";
-import { tr } from "../../../packages/i18n/src/locales/tr/index.ts";
-import { ko } from "../../../packages/i18n/src/locales/ko/index.ts";
+import { en } from "../../../packages/i18n/dist/locales/en/index.js";
+import { zhCN } from "../../../packages/i18n/dist/locales/zh-CN/index.js";
+import { tr } from "../../../packages/i18n/dist/locales/tr/index.js";
+import { ko } from "../../../packages/i18n/dist/locales/ko/index.js";
 
 const catalogs = { en, "zh-CN": zhCN, tr, ko };
 
@@ -213,9 +213,16 @@ test("marketplace package downloads stay inside the host allowlist", () => {
   );
   assert.match(hostSrc, /fn package_host_allowed\(package_url: &str, catalog_url: &str\) -> Result<\(\)>/);
   // Refuse before the request leaves the machine, then hold the redirect
-  // chain to the same rule: a release asset always redirects.
-  assert.match(hostSrc, /package_host_allowed\(&info\.url, &catalog_url\)\?;/);
-  assert.match(hostSrc, /download_url_guarded\(&info\.url, Some\(&catalog_url\)\)/);
+  // chain to the same rule: a release asset always redirects. Every package
+  // URL passes through this one path, whichever channel named it — the
+  // official channel's mirror list included.
+  assert.match(hostSrc, /package_host_allowed\(url, &catalog_url\)\?;/);
+  // The observed downloader is the same boundary: it refuses an off-allowlist
+  // host before the request and re-checks the effective URL after redirects.
+  assert.match(
+    hostSrc,
+    /download_url_observed\(\s*url,\s*Some\(&catalog_url\),\s*expected_size,\s*report\)/,
+  );
   assert.match(hostSrc, /"--proto-redir"\.into\(\)/);
   assert.match(hostSrc, /"%\{url_effective\}"\.into\(\)/);
   assert.match(hostSrc, /must not embed credentials/);
@@ -245,7 +252,7 @@ test("a withdrawn version is never offered and never silently disabled", () => {
 test("verified trust is not something a catalog entry can grant itself", () => {
   const hostSrc = marketplaceSrc;
   assert.match(hostSrc, /fn resolve_trust\(&self, entry: &MarketCatalogEntry\) -> String/);
-  assert.match(hostSrc, /"verified" if self\.is_official_market_source\(\) => "verified"/);
+  assert.match(hostSrc, /"verified" if self\.is_trusted_channel\(\) => "verified"/);
   assert.match(hostSrc, /"verified" => "community"/);
 
   assert.match(pageSrc, /function showsVerifiedBadge\(/);

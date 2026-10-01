@@ -1,12 +1,12 @@
-import { dialog, shell } from "electron";
+import { BrowserWindow, dialog, shell, type OpenDialogOptions } from "electron";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, statSync } from "node:fs";
+import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import {
   ErrorCodes,
   IPC,
-  type ComposerCommand,
   type ComposerPasteFile,
   type FsChatRefProjectRoot,
   type FsChatRefResolveResult,
@@ -25,17 +25,17 @@ import {
   consumeComposerPickerSelection,
   rememberComposerPickerSelection,
 } from "../composer-picker";
-import { collectWorkspaceDiff } from "../git-diff";
+import { collectWorkspaceDiff } from "@pi-desktop/host-runtime";
 import { parseAllowedExternalUrl } from "../safe-open-external";
 import {
   isAttachmentBlobRef,
   listDir,
   readOpenableFile,
   readOpenableImage,
-  resolveOpenablePath,
   resolveRealOpenablePath,
-} from "../fs-panel";
-import { resolveChatFileRef } from "../chat-ref-resolve";
+} from "@pi-desktop/host-runtime";
+import { openableMp4Path } from "../open-attachment-video";
+import { isChatRefOutsideRoots, resolveChatFileRef } from "../chat-ref-resolve";
 import { getWorkspaceFileIndex } from "../fs-index";
 import {
   projectFolderPaths,
@@ -48,6 +48,7 @@ import type { AgentSidecar } from "../agent-sidecar";
 import type { HostProcess } from "../host-process";
 import type { Logger } from "../logger";
 import type { ClipboardHistory } from "../clipboard-history";
+import { getModuleDirectory } from "../module-path";
 import type { PluginRuntime } from "../plugin-runtime";
 import type { IpcRegistrar } from "./types";
 
@@ -74,6 +75,7 @@ export function createComposerTemplateLoader(
 
 export type WorkspaceIpcDependencies = {
   registrar: IpcRegistrar;
+  getMainWindow: () => Electron.BrowserWindow | null;
   getHost: () => HostProcess | null;
   getSidecar: () => AgentSidecar | null;
   dataDir: string;
@@ -81,7 +83,6 @@ export type WorkspaceIpcDependencies = {
   plugins: PluginRuntime;
   browserHost: BrowserHost;
   clipboardHistory: ClipboardHistory;
-  logger: Pick<Logger, "app">;
   recordPastedClipboardFiles: (files: ComposerPasteFile[]) => void;
   currentWorkspacePath: () => string | null;
   setCurrentWorkspacePath: (path: string | null) => void;
@@ -91,6 +92,7 @@ export type WorkspaceIpcDependencies = {
 
 export function registerWorkspaceIpc({
   registrar,
+  getMainWindow,
   getHost,
   getSidecar,
   dataDir,
@@ -98,7 +100,6 @@ export function registerWorkspaceIpc({
   plugins,
   browserHost,
   clipboardHistory,
-  logger,
   recordPastedClipboardFiles,
   currentWorkspacePath,
   setCurrentWorkspacePath,
@@ -124,6 +125,46 @@ export function registerWorkspaceIpc({
     });
   };
   const assertMainWindowSender = registrar.assertMainWindowSender;
+  let composerPickerActive = false;
+  let projectPickerActive = false;
+
+  // Native composer dialogs are process-wide; reject duplicate requests while
+  // one is open instead of queueing another dialog behind it.
+  const openComposerPicker = async (
+    event: Electron.IpcMainInvokeEvent,
+    options: OpenDialogOptions,
+  ): Promise<{ token: string | null; canceled: boolean }> => {
+    if (composerPickerActive) return { token: null, canceled: true };
+    composerPickerActive = true;
+    try {
+      const owner = BrowserWindow.fromWebContents(event.sender);
+      const result = owner
+        ? await dialog.showOpenDialog(owner, options)
+        : await dialog.showOpenDialog(options);
+      if (result.canceled || result.filePaths.length === 0) {
+        return { token: null, canceled: true };
+      }
+      return {
+        token: rememberComposerPickerSelection(result.filePaths, event.sender.id),
+        canceled: false,
+      };
+    } finally {
+      composerPickerActive = false;
+    }
+  };
+
+  const openProjectPicker = async (options: OpenDialogOptions) => {
+    if (projectPickerActive) return null;
+    projectPickerActive = true;
+    try {
+      const owner = getMainWindow();
+      return owner
+        ? await dialog.showOpenDialog(owner, options)
+        : await dialog.showOpenDialog(options);
+    } finally {
+      projectPickerActive = false;
+    }
+  };
 
   const managedProjectPath = async (input: unknown): Promise<string> => {
     if (!host) throw new Error("host unavailable");
@@ -164,7 +205,9 @@ export function registerWorkspaceIpc({
     const seed =
       process.env.PI_DESKTOP_SEED_WORKSPACE ||
       process.env.PI_DESKTOP_WORKSPACE ||
-      (isDevelopmentBuild ? join(__dirname, "../../..") : "");
+      (isDevelopmentBuild
+        ? join(getModuleDirectory(import.meta.url), "../../..")
+        : "");
     if (!res.workspace && seed) {
       try {
         res = (await host.call("workspace.set", { path: seed })) as {
@@ -349,10 +392,10 @@ export function registerWorkspaceIpc({
   });
   handle(IPC.invoke.projectOpen, async () => {
     if (!host) throw new Error("host unavailable");
-    const result = await dialog.showOpenDialog({
+    const result = await openProjectPicker({
       properties: ["openDirectory", "createDirectory"],
     });
-    if (result.canceled || !result.filePaths[0]) {
+    if (!result || result.canceled || !result.filePaths[0]) {
       return { workspace: null, canceled: true };
     }
     const res = (await host.call("workspace.set", {
@@ -362,10 +405,10 @@ export function registerWorkspaceIpc({
     return { workspace: await withGitBranch(res.workspace), canceled: false };
   });
   handle(IPC.invoke.projectPickFolders, async () => {
-    const result = await dialog.showOpenDialog({
+    const result = await openProjectPicker({
       properties: ["openDirectory", "multiSelections", "createDirectory"],
     });
-    if (result.canceled || result.filePaths.length === 0) {
+    if (!result || result.canceled || result.filePaths.length === 0) {
       return { folders: [], canceled: true };
     }
     return { folders: result.filePaths, canceled: false };
@@ -374,11 +417,11 @@ export function registerWorkspaceIpc({
     const parentDefault = currentWorkspacePath()
       ? dirname(currentWorkspacePath()!)
       : homedir();
-    const picked = await dialog.showOpenDialog({
+    const picked = await openProjectPicker({
       defaultPath: parentDefault,
       properties: ["openDirectory", "createDirectory"],
     });
-    if (picked.canceled || !picked.filePaths[0]) {
+    if (!picked || picked.canceled || !picked.filePaths[0]) {
       return { workspace: null, canceled: true };
     }
     const dest = await cloneGitRepository({
@@ -391,6 +434,28 @@ export function registerWorkspaceIpc({
     });
     return { workspace, canceled: false };
   });
+
+  handle(
+    IPC.invoke.projectCloneCheckout,
+    async (input: { url?: unknown; parentPath?: unknown } = {}) => {
+      const url = typeof input.url === "string" ? input.url.trim() : "";
+      const parentPath =
+        typeof input.parentPath === "string" ? input.parentPath.trim() : "";
+      if (!url || !parentPath) {
+        throw Object.assign(
+          new Error("repository URL and parent folder required"),
+          { errorCode: ErrorCodes.INVALID_ARGUMENT },
+        );
+      }
+      // Clone only. The renderer still creates the logical project group, so
+      // the active host workspace stays untouched until activation.
+      const dest = await cloneGitRepository({ url, parentPath });
+      return {
+        path: dest,
+        name: dest.split(/[\\/]/).filter(Boolean).at(-1) || dest,
+      };
+    },
+  );
   handle(IPC.invoke.projectSet, async (path: string) => {
     if (!host) throw new Error("host unavailable");
     setCurrentWorkspacePath(path);
@@ -461,34 +526,20 @@ export function registerWorkspaceIpc({
     },
   );
 
-  handleWithEvent(IPC.invoke.composerPickFiles, async (event) => {
-    const result = await dialog.showOpenDialog({
+  handleWithEvent(IPC.invoke.composerPickFiles, async (event) =>
+    openComposerPicker(event, {
       properties: ["openFile", "multiSelections"],
-    });
-    if (result.canceled || result.filePaths.length === 0) {
-      return { token: null, canceled: true };
-    }
-    return {
-      token: rememberComposerPickerSelection(result.filePaths, event.sender.id),
-      canceled: false,
-    };
-  });
+    }),
+  );
 
-  handleWithEvent(IPC.invoke.composerPickPhotos, async (event) => {
-    const result = await dialog.showOpenDialog({
+  handleWithEvent(IPC.invoke.composerPickPhotos, async (event) =>
+    openComposerPicker(event, {
       properties: ["openFile", "multiSelections"],
       filters: [
         { name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp", "heic", "tif", "tiff"] },
       ],
-    });
-    if (result.canceled || result.filePaths.length === 0) {
-      return { token: null, canceled: true };
-    }
-    return {
-      token: rememberComposerPickerSelection(result.filePaths, event.sender.id),
-      canceled: false,
-    };
-  });
+    }),
+  );
 
   handleWithEvent(
     IPC.invoke.composerImportFiles,
@@ -687,12 +738,36 @@ export function registerWorkspaceIpc({
    * registered group root a valid containment base, so a chat reference that
    * resolves in a sibling folder still opens instead of failing containment —
    * which is what a user without the file view would otherwise see.
+   *
+   * Both the spelling of the root and its `realpath` are returned: a producer
+   * that canonicalizes what it records (image generation realpaths its output
+   * directory) would otherwise write a path that no listed root contains when
+   * `dataDir` or a project folder sits behind a link (`/var` on macOS, a linked
+   * or synced folder). The two entries name the same directory, and every
+   * candidate is still re-checked through `realpath` before a read is allowed.
    */
-  const fsExtraRoots = async (workspaceRoot: string | null): Promise<string[]> => [
-    join(dataDir, "scratch"),
-    join(dataDir, "attachments"),
-    ...projectFolderPaths(workspaceRoot).filter((path) => path !== workspaceRoot),
-  ];
+  const fsExtraRoots = async (workspaceRoot: string | null): Promise<string[]> => {
+    const roots = [
+      join(dataDir, "scratch"),
+      join(dataDir, "attachments"),
+      ...projectFolderPaths(workspaceRoot).filter((path) => path !== workspaceRoot),
+    ];
+    const canonical = await Promise.all(
+      roots.map(async (root) => {
+        try {
+          return await realpath(root);
+        } catch {
+          return null;
+        }
+      }),
+    );
+    return [
+      ...new Set([
+        ...roots,
+        ...canonical.filter((root): root is string => typeof root === "string"),
+      ]),
+    ];
+  };
 
   /**
    * The session's own scratch directory (ADR 0124), or null when the session
@@ -798,10 +873,11 @@ export function registerWorkspaceIpc({
     return { ok: true };
   });
 
-  handle(IPC.invoke.fsOpen, async (input: { path?: string } = {}) => {
+  handle(IPC.invoke.fsOpen, async (input: { path?: string; mimeType?: string } = {}) => {
     const workspaceRoot = await optionalWorkspaceRoot();
-    const target = resolveOpenablePath(
-      String(input.path ?? ""),
+    const requested = String(input.path ?? "").trim();
+    const target = await resolveRealOpenablePath(
+      requested,
       workspaceRoot,
       await fsExtraRoots(workspaceRoot),
     );
@@ -810,7 +886,13 @@ export function registerWorkspaceIpc({
         errorCode: ErrorCodes.INVALID_ARGUMENT,
       });
     }
-    const openError = await shell.openPath(stripWinLongPrefix(target));
+    if (!(await stat(target)).isFile()) {
+      throw Object.assign(new Error("not a file"), {
+        errorCode: ErrorCodes.INVALID_ARGUMENT,
+      });
+    }
+    const openPath = await openableMp4Path(dataDir, target, input.mimeType);
+    const openError = await shell.openPath(stripWinLongPrefix(openPath));
     if (openError) throw new Error(openError);
     return { ok: true };
   });
@@ -837,13 +919,15 @@ export function registerWorkspaceIpc({
       const ref = String(input.ref ?? "").trim();
       if (!ref) return { match: null };
       const workspaceRoot = await optionalWorkspaceRoot();
-      return {
-        match: await resolveChatFileRef(ref, {
-          project: projectRootsFor(workspaceRoot),
-          scratch: await sessionScratchRoot(input.sessionId),
-          attachments: join(dataDir, "attachments"),
-        }),
+      const roots = {
+        project: projectRootsFor(workspaceRoot),
+        scratch: await sessionScratchRoot(input.sessionId),
+        attachments: join(dataDir, "attachments"),
       };
+      if (await isChatRefOutsideRoots(ref, roots)) {
+        return { match: null, reason: "outside-allowed-roots" };
+      }
+      return { match: await resolveChatFileRef(ref, roots) };
     },
   );
 

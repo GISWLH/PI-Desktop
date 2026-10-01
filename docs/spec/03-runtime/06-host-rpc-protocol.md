@@ -16,7 +16,14 @@ MVP transport decision (**D001**):
 
 - Process: Electron main spawns Rust host-core sidecar
 - Channel: child process stdin/stdout
-- Framing: one JSON object per line (NDJSON)
+- Framing: one JSON object per LF-delimited line (NDJSON); CRLF is accepted.
+  U+2028 and U+2029 inside JSON strings are payload, never frame delimiters.
+  All Node stdio readers preserve UTF-8 characters across input chunks and
+  release buffered fragments/listeners on transport close. A final unterminated
+  frame is accepted at EOF for compatibility.
+- Invalid JSON frames produce a diagnostic containing only the byte length,
+  never payload text, before being discarded. Later complete frames remain
+  readable. Existing session text is not rewritten or migrated.
 - Encoding: UTF-8
 - Request/response: JSON-RPC 2.0 style
 
@@ -284,10 +291,12 @@ to later refresh and inference; the vendor picker does not collect them.
   The child inherits project/provider/model/mode/thinking and
   permission configuration, receives new message/tool-call ids, and starts
   without turns, revisions, notifications, artifacts, grants, or scratch data.
-  Missing sources return `NOT_FOUND`; Electron rejects active sources with
-  `AGENT_BUSY` before forwarding and normalizes the host's persisted
-  running-turn `CONFLICT` fallback to `AGENT_BUSY`; an unknown source or
-  `throughMessageId` returns `NOT_FOUND`
+  Missing sources or anchors return `NOT_FOUND`. While a Desktop source runs,
+  only a completed assistant prefix containing no indexed messages owned by a
+  running turn is allowed. This check and publication share the host RPC lock.
+  Whole-session, non-assistant, streaming/error, or live-turn anchors return
+  `CONFLICT`, normalized by Electron to `AGENT_BUSY`. The source turn continues
+  without sharing runtime state with the child.
 - `session.get` — accepts an optional renderer read window:
   `messageBefore` is the exclusive zero-based end offset, `messageLimit` is
   the positive page size, and `contentLimit` is the positive character budget
@@ -317,7 +326,8 @@ to later refresh and inference; the vendor picker does not collect them.
   only session metadata and does not update `updated_at`, transcript content,
   message count, or historical notification title snapshots.
 - `session.configure` — atomically persists `mode`, `providerId`, `modelId`,
-  and optional `thinkingLevel` for the next pi turn; omitting/null
+  and optional `thinkingLevel` (`off|minimal|low|medium|high|xhigh|max|omit`)
+  for the next pi turn; omitting/null
   `thinkingLevel` preserves the current value; invalid modes or levels return
   `INVALID_PARAMS`; mode is `plan | goal | agent` and changing any session
   configuration is allowed only while idle and without a pending/queued/running
@@ -397,9 +407,15 @@ to later refresh and inference; the vendor picker does not collect them.
   session, rechecks its permission ceiling, claims the delivery, and binds the
   new turn to its message id. A collaboration turn cannot be started from
   caller-supplied replacement text.
-- `session.queuePush` / `session.queueList` / `session.queueRemove` — the
-  Host-owned turn queue (D386 / ADR 0213, schema v15); push is idempotent per
-  principal and key, bounded at eight entries per session
+- `session.queuePush` / `session.queueList` / `session.queueRemove` /
+  `session.queuePrioritize` / `session.queueReorder` — the Host-owned turn queue
+  (D386 / ADR 0213 / ADR 0265, schema v18); push is idempotent per principal and
+  key, bounded at eight entries per session. `queuePrioritize` appends an entry
+  to the end of its session's priority block (`priority = MAX + 1`) and refuses
+  an already promoted entry with `CONFLICT`; `queueReorder` swaps one
+  non-promoted entry with its adjacent non-promoted neighbour and reports
+  `{ moved }`. Listing and delivery order is `priority ASC` for promoted entries
+  followed by `position ASC` for the rest
 - `session.endTurn` — atomically moves a running turn to its terminal state and
   conditionally returns the newly created notification for `completed`/`error`;
   returns no notification when `createNotification=false`, for `aborted`, or
@@ -426,6 +442,9 @@ Electron main after plugin permission and manifest-source checks:
 - `plugin.session.rename` — rename an owned active imported session
 - `plugin.session.delete` — `trash` hides and retains the transcript; `purge`
   removes it and permits re-import
+- `plugin.usage.listTurns` — keyset page of completed-turn facts (identifiers
+  and token counters, never a message body) for non-deleted sessions. Gated
+  in Electron main by `usage.read`. Additive; no protocol version bump.
 - Successful plugin session mutations cause Electron main to emit one
   `sessionsChanged` renderer event; the renderer refreshes the session list,
   and plugins do not emit this UI synchronization event.
@@ -461,12 +480,36 @@ The ledger is durable across a host restart. A queued entry with its
 an unclaimed or running delivery is marked `interrupted` by the startup fence
 and is never replayed automatically. Transcript provenance is host-derived and
 cannot be forged or removed by `session.appendMessage` or transcript
-replacement.
+replacement. Steering (`UiMessage.steering`) into a claimed delivery turn is
+additional human input in that session: it does not receive the delivery
+origin, and a client-supplied `session_message` is stripped (D597).
 
 The host rejects unknown roles, non-RFC3339 or non-monotonic timestamps, and
 oversized/deep payloads. Tool values are sanitized for host-reserved keys. The
 per-plugin rolling limits are 10 single imports, 5 batch imports, and 20
 deletes per 60 seconds. P2/P3 methods are not present in protocol v11.
+
+### Session Todo checklist
+
+- `todos.get({ sessionId })` returns the committed checklist snapshot for a live
+  Desktop session: `{ sessionId, todos, revision, updatedAt }`. Unknown or
+  soft-deleted sessions return `NOT_FOUND`; native Pi sessions and blank ids are
+  rejected as `INVALID_ARGUMENT`.
+- `tools.execute` with `toolName: "TodoWrite"` accepts only `{ todos }` and
+  replaces the complete ordered checklist. The host trims content, defaults
+  priority to `medium`, truncates overlong Unicode content at 500 characters
+  with a warning, demotes later `in_progress` items to `pending`, and rejects
+  more than 50 items or malformed values. The owner session and running turn
+  come from the trusted transport fields, never from tool arguments.
+- TodoWrite is allowed only for an Agent session's own running turn. Plan/Goal,
+  delegated, plugin, and MCP calls receive a tool result error and do not mutate
+  storage. A successful replacement advances the session revision even when
+  `todos` is empty and emits `todos.changed` after the transaction commits.
+  The event payload is the same complete snapshot returned by `todos.get`.
+- SQLite ownership is host-core only. The renderer receives snapshots through
+  Electron Main IPC, keeps them by session id, and ignores revisions older than
+  or equal to the cached revision. Remote RACP sessions are local-only for this
+  vertical slice because RACP v1 has no Todo snapshot operation.
 
 ### Stats
 
@@ -547,14 +590,18 @@ resource exhaustion (`EAGAIN` / `WouldBlock`) with bounded backoff, never
 retries a command after it has started, and reaps timed-out children before
 releasing the execution slot.
 
-`session.appendMessage` is idempotent by message id. Electron main may keep
+`session.appendMessage` is idempotent by message id. An id already indexed in
+another session is remapped to `{sessionId}:{id}` before the JSONL write, and
+a later replay of the original id is a no-op (D444). Electron main may keep
 message appends in its application-owned outbox while host-core is restarting;
-the outbox flushes in order after a successful handshake. A missing sessions
-row is restored from the live JSONL (or created as a stub under the same id
-when the file is gone) so a queued outbox can drain (D318). `session.delete`
-drops that session's outbox entries. In-flight checkpoints never go through
-the outbox: a checkpoint is only meaningful against a live host, and replaying
-one after the final row would be wrong.
+the outbox flushes in order after a successful handshake and treats
+`UNIQUE constraint failed: messages.id` as an ack rather than pausing the
+queue. A `PERMISSION_DENIED:` append is dropped the same way so a poison head
+cannot stall the FIFO (D597). A missing sessions row is restored from the live JSONL (or created as a
+stub under the same id when the file is gone) so a queued outbox can drain
+(D318). `session.delete` drops that session's outbox entries. In-flight
+checkpoints never go through the outbox: a checkpoint is only meaningful
+against a live host, and replaying one after the final row would be wrong.
 
 ### Permissions
 - `permissions.evaluate`
@@ -607,14 +654,28 @@ one after the final row would be wrong.
 ### Agent capabilities (skills, subagents, MCP servers)
 - `skills.list` / `skills.active` / `skills.read` / `skills.create` /
   `skills.update` / `skills.remove` / `skills.import` /
-  `skills.setEnabled` / `skills.setScope` — user skill documents
-  (`SKILL_INVALID` on validation failure)
+  `skills.setEnabled` / `skills.setScope` / `skills.transfer` — user skill
+  documents (`SKILL_INVALID` on validation failure)
 - `agents.list` / `agents.active` / `agents.read` / `agents.create` /
   `agents.update` / `agents.remove` / `agents.setEnabled` /
   `agents.setScope` — user subagent documents (`SUBAGENT_INVALID`)
 - `mcp.list` / `mcp.active` / `mcp.upsert` / `mcp.remove` /
-  `mcp.setEnabled` / `mcp.setScope` — user MCP server definitions
-  (`MCP_INVALID`)
+  `mcp.setEnabled` / `mcp.setScope` / `mcp.transfer` — user MCP server
+  definitions (`MCP_INVALID`)
+
+`skills.transfer` and `mcp.transfer` take `{ id, from, to }`, each end a
+`{ level, projectPath? }` target (`projectPath` is required for the project
+level), and return `{ skill }` / `{ server }` for the document where it landed.
+A transfer moves the document between the two levels rather than copying it, so
+the source level stops listing the entry. A destination that already owns the
+same id gives the arriving document a `-2`/`-3` id suffix; one that owns the
+same display name / label, compared case-insensitively, gives it a matching
+` (2)`/` (3)` display suffix. The existing entry stays untouched. Enablement
+travels with the document: the source level drops every state entry for the old
+id, including its project overrides, and the destination stores the value the
+source was showing (a project target keeps that project's state, a global
+target the global default). Naming the source's own directory as the
+destination is a no-op.
 
 `*.active` returns the entries that apply to the given project after
 activation-scope filtering (`CAPABILITY_INVALID` for an unknown scope).
@@ -699,6 +760,10 @@ type NotificationListResult = {
 - `notification.markAllRead({}) -> { ok: true }` updates every unread row in
   one transaction.
 - `notification.clear({}) -> { ok: true }` deletes inbox rows only.
+- `id` is the stable exactly-once key for renderer and native delivery. A
+  client must discard duplicate or delayed records for an id it has already
+  acknowledged/cleared; clearing the inbox never makes an old terminal turn
+  eligible for insertion again. A later terminal turn receives a new id.
 - No `notification.created` JSON-RPC server notification is emitted. Electron
   receives the inserted record directly from `session.endTurn`, avoiding a
   second ordering channel between terminal turn persistence and UI refresh.
@@ -756,7 +821,7 @@ Authoritative mode and workspace resolution are session-scoped:
 For `Read`/`Glob`/`Grep`/`Write`/`Edit`, the host classifies an explicit path
 outside the workspace and scratch roots before the low-risk auto-allow rule.
 `auto` executes it, while `ask` and `accept-edits` emit
-`permissions.request`; denial, timeout, or cancellation returns `TOOL_DENIED`
+`permissions.request`; denial or cancellation returns `TOOL_DENIED`
 without executing the operation. Relative `..` and symlink escapes use the
 same classification. Bash's working directory and implicit recursive walks do
 not inherit this exception.
@@ -1018,7 +1083,6 @@ params: {
   risk: "low" | "medium" | "high"
   argsPreview: unknown
   reason: string
-  timeoutMs: 120000
 }
 ```
 
@@ -1032,14 +1096,16 @@ params: {
 }
 ```
 
-Timeout behavior (**D005**): after 120s unresolved → deny.
+Local permission behavior (**D636 / ADR 0310**): an unresolved request remains
+pending until an explicit decision, cancellation, or host/process shutdown.
+The transport does not apply a deadline to `tools.execute`; tool-specific
+execution budgets still apply after approval.
 
 `permissions.pending` returns the open requests as Host state (D374/D375):
 `{ requests: PendingPermission[] }`, oldest first, optionally scoped by
 `sessionId`. Each entry carries the same fields as the `permissions.request`
-notification plus `createdAt`, `expiresAt`, and `remainingMs`. Requests past
-the timeout are omitted. A client that attaches after the notification was
-emitted reads this list and answers through the unchanged
+notification plus `createdAt`. Requests remain listed until settled. A client
+that attaches after the notification was emitted reads this list and answers through the unchanged
 `permissions.resolve`; the notification path itself does not change.
 
 ## 7. Error codes
@@ -1055,6 +1121,7 @@ numeric slot; the string is the contract, the number is transport detail.
 | 1001 | HOST_SHUTTING_DOWN | the host is draining after EOF and refused the call |
 | 1002 | INVALID_PARAMS | schema validation failed |
 | 1002 | MODEL_ALIAS_TOO_LONG | provider row alias exceeds 60 code points |
+| 1002 | MODEL_BINDINGS_DEGRADED | stored model bindings are unreadable; explicit model-array replacement is refused |
 | 1003 | NOT_FOUND | entity missing (legacy slot, kept for old callers) |
 | 1006 | RATE_LIMITED | a per-caller budget window was exhausted |
 | 1007 | NOT_FOUND | entity missing |
@@ -1072,6 +1139,12 @@ numeric slot; the string is the contract, the number is transport detail.
 | 1016 | SKILL_INVALID | user skill document failed validation |
 | 1017 | SUBAGENT_INVALID | user subagent document failed validation |
 | 1018 | CAPABILITY_INVALID | agent capability root/scope setting failed validation |
+| 1019 | PLUGIN_CANCELLED | the user cancelled a marketplace install while it was downloading |
+| 1020 | PLUGIN_MARKET_NOT_PUBLISHED | the platform has the version and is not offering it yet |
+| 1021 | PLUGIN_MARKET_ARCHIVED | the plugin was withdrawn from the platform |
+| 1022 | PLUGIN_MARKET_NOT_FOUND | the platform does not have that plugin or version |
+| 1023 | PLUGIN_MARKET_RATE_LIMITED | the download endpoint asked the client to wait |
+| 1024 | PLUGIN_MARKET_NO_SOURCE | no distribution target can serve the package |
 | -32029 | HOST_OVERLOADED | RPC dispatcher capacity exhausted |
 | -32601 | — | unknown method |
 | -32700 | — | unparseable request line |
@@ -1123,7 +1196,7 @@ Tool outcomes (`TOOL_DENIED`, `TOOL_TIMEOUT`, `PATH_OUTSIDE_WORKSPACE`,
 1. Electron spawns host and completes handshake
 2. health method returns ok
 3. denied tool path returns `TOOL_DENIED`
-4. timeout path returns deny decision after 120s
+4. an unresolved permission remains pending until an explicit decision or cancellation
 5. switching the selected workspace from A to B does not change the tool root
    of a call issued by session A
 6. Protocol v4 `session.endTurn` creates/returns exactly one notification for
@@ -1149,3 +1222,86 @@ Tool outcomes (`TOOL_DENIED`, `TOOL_TIMEOUT`, `PATH_OUTSIDE_WORKSPACE`,
     produce the documented durable statuses and events
 13. Bash validates the pinned shell ID/dialect, streams stdout/stderr, enforces
     the 60s default/bounded override, and shuts down the complete process tree
+
+## Scheduled automation tools
+
+Agent mode advertises on-demand ScheduledTaskList, ScheduledTaskCreate,
+ScheduledTaskUpdate and ScheduledTaskDelete tools. They run through
+`tools.execute`, including existing permissions and audit records, and reuse
+the scheduled RPC domain handlers. List is low risk; mutations require normal
+approval in Ask/Accept Edits. Plan/Goal deny all four even under Auto.
+
+The Host rechecks durable session mode and derives project scope from the
+calling session, never the foreground workspace or model-supplied paths.
+Create binds that scope; list filters it; update/delete require matching scope.
+Unknown fields, invalid cadence, empty title/prompt, invalid time and invalid
+weekday selections are rejected before mutation. Delete refuses active runs.
+Create requires title, prompt and cadence; automatic daily/weekly tasks require
+a schedule. Update takes an existing ID and partial fields, preserving all
+unspecified configuration. Exact local times remain supported despite the
+UI's four period presets. No new DB schema or transport is introduced.
+
+### Scheduled tasks: task-owned execution settings
+
+Desktop create/update may save `workspacePath`, `permissionMode` and a paired
+`providerId`/`modelId` on one task. Run now and automatic execution use those
+values when present. Missing fields preserve legacy project capture, app-default
+model resolution and permission behavior. Invalid permission values and partial
+model pairs are rejected before mutation. Conversation tools do not expose these
+fields and remain bound to the calling session's project. See ADR 0305.
+
+Tasks also persist optional `thinkingLevel` using the existing session values
+(including `off` and `omit`). The full Composer model/reasoning picker and
+controller are reused with a task-draft configuration callback. Both manual and
+automatic runs apply the saved level. Missing or cleared levels retain the
+legacy `off` behavior; no database migration is required.
+
+### Scheduled tasks: independent task dispatch
+
+The Electron runner admits independent due tasks without awaiting another task's prompt setup. Local in-flight ownership is keyed by task ID and Host instance until setup settles; Host remains authoritative for enabled, due and overlap checks. A replaced Host's completion cannot clear its successor's local ownership. Stop prevents new polls; admitted work keeps the existing execution/failure lifecycle. Failures remain observable and the 90-second late policy is unchanged.
+### Scheduled tasks: project removal and automations
+
+Removing a project pauses its bound scheduled tasks without deleting their definitions, schedule, workspace binding or run history. Session references in history may become null when the project's conversations are removed. Already admitted task runs block removal even before a conversation turn starts. Tasks belonging to other projects and unbound legacy tasks are unaffected. Explicit resume or Run now may recreate a project from the preserved path; automatic polling cannot do so while paused.
+### Scheduled tasks: legacy task maintenance
+
+Agent tools allow title, prompt and pause updates on legacy automatic tasks without a schedule, including an echoed unchanged cadence. These edits do not arm the task or capture the foreground workspace. Explicit enabling, a cadence change or a supplied schedule still follows schedule validation. Resume requires an explicit valid schedule; Manual-to-Hourly retains its existing default interval behavior.
+### Scheduled tasks: calendar intent
+
+The optional config_json.calendarConfigured boolean distinguishes an explicitly configured Daily/Weekly calendar from Hourly's internal schedule placeholder. Without the key, legacy Daily/Weekly schedules are treated as configured; legacy Hourly schedules retain their values but require an explicit schedule when converting to Daily/Weekly. Known calendar intent survives Hourly and restart, including midnight. Clearing or replacing the calendar with a different non-calendar placeholder clears intent. This additive extension needs no table/schema migration; older versions ignore it and cannot enforce the new conversion guard. Metadata-only edits and Manual-to-Hourly remain unchanged.
+### Scheduled tasks: workspace identity
+
+Stored workspace bindings use the existing project canonicalization contract on both write and read. On Windows, slash direction, case, trailing separators and extended path prefixes do not hide a task from its own project's conversation. The distinction between missing legacy bindings and explicit null remains unchanged. Foreign-project tools cannot list or mutate bound tasks.
+
+### Cloud configuration sync
+
+The Host exposes the `configSync.getState`, `configSync.test`,
+`configSync.configure`, `configSync.syncNow`, `configSync.pause`,
+`configSync.unlock`, `configSync.approve`, `configSync.reject`,
+`configSync.mapProject`, `configSync.listHistory`, `configSync.restore`,
+`configSync.changePassword`, and
+`configSync.disconnect` methods through the existing Electron Host bridge.
+These methods operate on the Host-owned encrypted vault and the explicit
+portable-domain adapter registry. They do not expose raw secrets or local
+filesystem bindings to the Renderer.
+
+`configSync.test` performs a capability probe against a temporary remote
+object and reports whether reliable strong conditional writes are available.
+`configSync.syncNow` and the five-minute automatic poll serialize per vault,
+reconcile against the last acknowledged base, publish immutable encrypted
+objects followed by a conditional head update, and retain unresolved
+conflicts/security-sensitive imports as pending state. A failed head
+precondition restarts from the newly read head; it never overwrites blindly.
+
+`configSync.listHistory` returns revision IDs, creation timestamps, parent IDs,
+and counts without decrypting data in the Renderer. `configSync.restore` requires
+an explicit propagation acknowledgement, writes an encrypted local recovery
+point, publishes a new head with a CAS, and keeps executable/security-sensitive
+entities pending until local approval. `configSync.changePassword` updates the
+wrapped-key header with a strong-ETag CAS; it does not revoke copied old vault
+keys.
+
+The public result is a redacted state snapshot. `configSync.changed` is a Host
+notification carrying that same snapshot. Approval and rejection require the
+current entity digest, so a security-relevant edit cannot reuse an older local
+decision. Disconnect deletes only local credentials, vault keys, metadata and
+staging files; remote objects remain intact.

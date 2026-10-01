@@ -22,6 +22,17 @@ type PluginManifestV1 = {
  name: string;
  version: string; // semver
  description?: string;
+ /**
+  * 展示文案的多语言表：当应用语言命中其中某个 locale 时用它替换
+  * `name` / `description`（见 §3.1）。扁平字段仍是作者自己的语言，也是最终回退。
+  */
+ i18n?: {
+   [locale: string]: {
+     name?: string;
+     description?: string;
+     safetyNotes?: string;
+   };
+ };
  author?: string | { name: string; url?: string; email?: string };
  homepage?: string;
  repository?: string;
@@ -64,6 +75,39 @@ type PluginUiConfig = {
 };
 ```
 
+### 3.1 多语言标签（`i18n`）
+
+`name`、`description` 和 `safetyNotes` 都是展示文案，插件可以用顶层 `i18n` 块按
+locale 声明。扩展页、插件启动器和市场（从 catalog 条目读取同一个块）显示的是**应用
+语言**对应的条目，而不是作者自己写的那一种：
+
+```json
+{
+  "name": "小清新待办",
+  "description": "作者原话",
+  "i18n": {
+    "en": { "name": "Todo List", "description": "A calm todo list" },
+    "zh-CN": { "name": "小清新待办", "description": "轻盈的待办清单", "safetyNotes": "只写自己的数据" }
+  }
+}
+```
+
+规则：
+
+1. `en` 与 `zh-CN` 是契约 locale。所有中文壳 locale（`zh`、`zh-CN`、`zh-Hans`、
+   `zh-SG`）读 `zh-CN`，其余读 `en`。插件不必为其他已发布壳 locale 提供翻译，
+   因此 `zh-TW` 读英文，而不是拿半份 `zh-CN` 猜测（ADR 0182）。
+2. 插件仓库的校验器要求两个 locale 与三个字段齐全，但宿主是宽容的：缺 locale、
+   缺字段或空字符串会按字段依次回退到另一个契约 locale，再回退到作者扁平的
+   `name` / `description`。
+3. 解析发生在宿主里，依据桌面壳下发的语言（`settings.language`，为 `auto` 时是
+   系统语言）。存储行保留作者原文，因此切换语言只改变读取结果，绝不改写注册表。
+4. 该块是展示元数据。格式错误（不是 locale → 对象的对象）会让 manifest 校验失败；
+   条目里未知的 locale 与未知字段一律忽略。
+5. 该块只服务身份文案（`name`、`description`、`safetyNotes`）。插件自有文案——面板、
+   视图、widget、生成式设置、toast、运行时命令标题——不在这里翻译。宿主只发布当前
+   语言（`pi.app.getLocale`、`appearance:changed`），由插件自行本地化（ADR 0280）。
+
 ## 4. 贡献
 
 ```ts
@@ -104,7 +148,7 @@ type PluginAgentToolContrib = {
 
 type PluginSettingContrib = {
  key: string;
- title: string;
+ title: string; // 作者语言；生成式设置面板不做本地化
  description?: string;
  type: "string" | "number" | "boolean" | "select" | "json" | "shortcut";
  default?: unknown;
@@ -139,8 +183,9 @@ type PluginThemeContrib = {
  label: string;
  path: string; // relative `.css` file
  base?: "light" | "dark"; // palette the overrides layer on, default `dark`
- assets?: string[]; // 绝对路径的 png/jpg/jpeg/webp/avif/svg/woff2，总和上限 4 MB；
-                    // 命中的 `url()` 会被改写为 `plugin-asset://`
+ assets?: string[]; // 插件包内相对路径或绝对路径；png/jpg/jpeg/webp/avif/svg/woff2 白名单，总和上限 4 MB；
+                    // 相对路径在插件根目录内解析，拒绝路径穿越和 `node_modules`；
+                    // 命中的 `url()` 改写为 `plugin-asset://`
 };
 
 type PluginWindowAppearanceContrib = {
@@ -203,8 +248,17 @@ type PluginProviderModelContrib = {
  contextWindow?: number;
  maxTokens?: number;
  supportsImages?: boolean;
+ /** 模型可提供的规范思考档位，按声明顺序保留。 */
+ thinkingLevels?: string[];
+ /** 当该值存在于 `thinkingLevels` 时，新会话使用它。 */
+ defaultThinkingLevel?: string;
 };
 ```
+`thinkingLevels` 可选。宿主会裁剪条目、丢弃未知规范档位、去重，并保留剩余的声明顺序。
+缺失或不可用的列表会变成空绑定。只有当 `defaultThinkingLevel` 命中该模型列表中的归一化档位
+时才会保留；否则会被丢弃，普通绑定归一化会选择第一个可用档位。
+清单校验会拒绝非数组的 `thinkingLevels`、其中任何非字符串条目，或非字符串的
+`defaultThinkingLevel`；未知的字符串档位则会被接受并在归一化时丢弃。
 
 ## 5. 权限枚举
 
@@ -224,6 +278,7 @@ type PluginPermission =
  | "agent.prompt.inject"
  | "provider.register"
  | "net.fetch"
+ | "net.anyHost"
  | "shell.openExternal"
  | "mcp.server.local"
  | "mcp.server.remote"
@@ -238,8 +293,10 @@ type PluginPermission =
  | "session.read.own"
  | "session.update.own"
  | "session.delete.own"
+ | "usage.read"
  | "audio.capture.background"
  | "audio.playback.background"
+ | "speech.adapter.register"
  | "keyboard.globalShortcut"
  | "net.websocket";
 ```
@@ -302,6 +359,15 @@ type PluginNetDomains = string[]; // "api.example.com" 或 "*.example.com"
 [03-plugin-api.md](/zh-CN/spec/07-plugins/03-plugin-api) §3）。该权限已实现：
 连接被限定在 `manifest.net.domains` 之内，未被声明的主机会在传输被要求
 打开任何东西之前就被拒绝。
+
+### 5.3.1 net.anyHost —— 豁免通道
+
+`"net.anyHost"` 面向端点由用户填写（自建服务器、个人域名等清单无法提前
+写明）的插件。持有该权限后，上述所有出网路径都对任意 http(s)/ws(s) 主机
+放行 —— 云元数据端点（`169.254.169.254` 等）除外，授权永远到不了那里：
+它们的应答是实例凭据。`net.domains` 已声明的主机保持现有行为，存量清单
+不受影响；未持有该权限的插件同样零变化。它与其他权限一样在安装/更新
+确认页展示，请求时不再有任何弹窗。
 
 ## 5. 1 总线主题语法
 

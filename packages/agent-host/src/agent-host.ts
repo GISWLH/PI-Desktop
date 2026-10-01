@@ -25,14 +25,15 @@ import type {
   RacpSessionStatus,
   RacpTurn,
   RacpTurnAdmission,
-  ToolPermissionRequest,
   UiMessage,
+  VoiceOrigin,
 } from "@pi-desktop/shared";
 import {
   RACP_ACTIVE_TURN_STATUSES,
   RACP_DEFAULT_LIMITS,
   RACP_DEFAULT_POLICY,
   applyMessageUpdate,
+  askToolOptionLabel,
   deltaStreamPayloadFits,
   effectiveRemotePermissionMode,
   racpKindForAgentEvent,
@@ -49,6 +50,7 @@ import {
   type Clock,
   type IdSource,
   type Principal,
+  type QueueReorderDirection,
   type QueueStore,
   type QueuedTurnRecord,
   type RuntimePort,
@@ -81,18 +83,41 @@ export type QueueEntryView = {
   turn: RacpTurn;
   content: string;
   sessionMessageId?: string;
+  userMessageId?: string;
+  voiceOrigin?: VoiceOrigin;
   attachments?: AgentPromptAttachment[];
+  /** Set only for promoted entries; entries are already in delivery order. */
+  priority?: number;
 };
 
 export type StartTurnParams = {
   sessionId: string;
   idempotencyKey?: string;
+  /** Main-private identity captured when authorizing a Live work scope. */
+  expectedWorkspaceIdentity?: string | null;
   admission?: RacpTurnAdmission;
-  input: { text: string; attachments?: AgentPromptAttachment[]; sessionMessageId?: string };
+  input: {
+    text: string;
+    attachments?: AgentPromptAttachment[];
+    sessionMessageId?: string;
+    /** Client-chosen id for the durable user row (D288). */
+    userMessageId?: string;
+    voiceOrigin?: VoiceOrigin;
+  };
   context: RacpRequestContext;
 };
 
 export type StartTurnResult = { accepted: true; turn: RacpTurn; cursor: RacpCursor };
+
+export type AgentWorkSnapshot = {
+  sessionId: string;
+  mode: "agent" | "plan" | "goal";
+  state: "idle" | "running" | "waiting-permission" | "waiting-input" | "finalizing";
+  activeTurnId?: string;
+  activeTurnStatus?: RacpTurn["status"];
+  queue: Array<{ queueEntryId: string; position: number }>;
+  revision: number;
+};
 
 export type AttachParams = {
   sessionId: string;
@@ -110,6 +135,10 @@ export type AttachResult = {
 };
 
 type TurnRecord = RacpTurn & {
+  /** A queued input consumed by another turn cannot be canceled retroactively. */
+  deliveredIntoTurnId?: string;
+  /** Only this input is reserved while runtime delivery is in flight. */
+  deliveryPending?: boolean;
   /** The runtime's own turn id when it differs from the RACP id (queued turns). */
   runtimeTurnId?: string;
   principalSubject?: string;
@@ -129,7 +158,13 @@ type SessionState = {
   remoteSubscribers: number;
 };
 
-type IdempotencyEntry = { turnId: string; inputHash: string };
+type IdempotencyEntry = {
+  turnId: string;
+  inputHash: string;
+  sessionId: string;
+  userMessageId?: string;
+  voiceOrigin?: { callId: string; operationId: string };
+};
 
 const MAX_IDEMPOTENCY_ENTRIES = 2000;
 const MAX_TURNS_PER_SESSION = 200;
@@ -159,8 +194,12 @@ export class AgentHost {
   private readonly states = new Map<string, SessionState>();
   private readonly turnIndex = new Map<string, string>();
   private readonly runtimeAliases = new Map<string, string>();
+  /** The dequeued turn whose runtime prompt acknowledgement is still pending. */
+  private readonly startingQueuedTurns = new Map<string, TurnRecord>();
   private readonly idempotency = new Map<string, IdempotencyEntry>();
   private readonly draining = new Set<string>();
+  /** A pass that arrived while one was running: the queue must be looked at again. */
+  private readonly drainPending = new Set<string>();
   private readonly admissions = new Map<string, Promise<void>>();
 
   constructor(options: AgentHostOptions) {
@@ -200,6 +239,7 @@ export class AgentHost {
     const meta2 = {
       turnId,
       parentToolCallId: envelope.parentToolCallId,
+      nestedParentToolCallId: envelope.nestedParentToolCallId,
       agentName: envelope.agentName,
     };
 
@@ -221,26 +261,23 @@ export class AgentHost {
           this.emit(state, "turn.activity", { event }, meta2);
           return;
         }
-        if (turn) {
-          turn.status = event.type === "error" ? "failed" : meta.interrupted ? "interrupted" : "completed";
-          turn.endedAt = new Date(envelope.ts).toISOString();
-          if (event.type === "error") {
-            turn.error = { code: event.error.code, message: event.error.message, retriable: event.error.retriable ?? false, traceId: event.error.traceId ?? "" };
-          }
-        }
-        state.activeItems.clear();
-        state.activeTurnId = undefined;
-        state.status = "idle";
-        for (const closed of this.approvals.cancelForSession(state.id, state.revision + 1)) {
-          this.emit(state, "approval.resolved", closed, meta2);
-        }
-        for (const [inputId] of state.pendingInputs) {
-          state.pendingInputs.delete(inputId);
-          this.emit(state, "input.resolved", { inputId, status: "canceled" }, meta2);
-        }
-        this.emit(state, mapping.kind, { event }, meta2);
-        this.emitSessionChanged(state);
-        void this.drain(state.id);
+        this.closeTurn(state, turn, {
+          status: event.type === "error" ? "failed" : meta.interrupted ? "interrupted" : "completed",
+          endedAt: new Date(envelope.ts).toISOString(),
+          ...(event.type === "error"
+            ? {
+                error: {
+                  code: event.error.code,
+                  message: event.error.message,
+                  retriable: event.error.retriable ?? false,
+                  traceId: event.error.traceId ?? "",
+                },
+              }
+            : {}),
+          kind: mapping.kind,
+          payload: { event },
+          meta: meta2,
+        });
         return;
       }
       case "message_start":
@@ -323,6 +360,7 @@ export class AgentHost {
         this.emit(state, "turn.activity", { event }, meta2);
         return;
       }
+      case "usage":
       case "turn_start":
       case "turn_end":
         this.emit(state, "turn.activity", { event }, meta2);
@@ -427,8 +465,30 @@ export class AgentHost {
     return this.withAdmission(params.sessionId, () => this.startTurnAdmitted(principal, params));
   }
 
-  private async startTurnAdmitted(principal: Principal, params: StartTurnParams): Promise<StartTurnResult> {
+  /** Append to the shared Host queue even when no turn is currently running. */
+  async enqueueTurn(principal: Principal, params: StartTurnParams): Promise<StartTurnResult> {
+    this.requireRole(principal, "turn/start");
+    const result = await this.withAdmission(params.sessionId, () => this.startTurnAdmitted(principal, params, true));
+    await this.drain(params.sessionId);
+    return {
+      ...result,
+      turn: this.getTurn(result.turn.id),
+      cursor: this.hub.stream(params.sessionId).cursor(),
+    };
+  }
+
+  private async startTurnAdmitted(
+    principal: Principal,
+    params: StartTurnParams,
+    forceQueue = false,
+  ): Promise<StartTurnResult> {
     const summary = await this.requireSession(params.sessionId);
+    if (
+      params.expectedWorkspaceIdentity !== undefined &&
+      summary.workspaceIdentity !== params.expectedWorkspaceIdentity
+    ) {
+      throw racpError("WORKSPACE_CHANGED", "the session workspace changed after this work scope was authorized");
+    }
     const state = this.state(summary.id);
     state.permissionMode = summary.permissionMode;
     const inputHash = hashInput(params.input);
@@ -455,10 +515,10 @@ export class AgentHost {
       pairedDevice: principal.pairedDevice ?? false,
       approverOverride: principal.approverOverride ?? false,
     });
-    const admission: RacpTurnAdmission = params.admission ?? "reject_if_busy";
+    const admission: RacpTurnAdmission = forceQueue ? "queue" : params.admission ?? "reject_if_busy";
     const busy = this.isBusy(state);
     let turn: TurnRecord;
-    if (busy) {
+    if (busy || forceQueue) {
       if (admission === "reject_if_busy") {
         throw racpError("AGENT_BUSY", "the session already has an active turn");
       }
@@ -468,6 +528,8 @@ export class AgentHost {
         principalSubject: principal.subject,
         content: params.input.text,
         ...(params.input.sessionMessageId ? { sessionMessageId: params.input.sessionMessageId } : {}),
+        ...(params.input.userMessageId ? { userMessageId: params.input.userMessageId } : {}),
+        ...(params.input.voiceOrigin ? { voiceOrigin: params.input.voiceOrigin } : {}),
         ...(params.input.attachments ? { attachments: params.input.attachments } : {}),
         effectivePermissionMode,
         ...(idempotencyKey ? { idempotencyKey } : {}),
@@ -489,13 +551,15 @@ export class AgentHost {
         sessionId: state.id,
         content: params.input.text,
         ...(params.input.sessionMessageId ? { sessionMessageId: params.input.sessionMessageId } : {}),
+        ...(params.input.userMessageId ? { userMessageId: params.input.userMessageId } : {}),
+        ...(params.input.voiceOrigin ? { voiceOrigin: params.input.voiceOrigin } : {}),
         ...(params.input.attachments ? { attachments: params.input.attachments } : {}),
         effectivePermissionMode,
         ...(idempotencyKey ? { idempotencyKey } : {}),
         principal,
       });
       turn = this.ensureTurn(state, started.turnId);
-      if (!isActive(turn.status)) turn.status = "running";
+      if (!isTerminal(turn.status) && !isActive(turn.status)) turn.status = "running";
       turn.admission = admission;
       turn.effectivePermissionMode = effectivePermissionMode;
       turn.idempotencyKey = idempotencyKey;
@@ -503,7 +567,13 @@ export class AgentHost {
       state.activeTurnId = turn.id;
       state.status = "running";
     }
-    if (idempotencyKey) this.rememberIdempotency(`${principal.subject}|${idempotencyKey}`, { turnId: turn.id, inputHash });
+    if (idempotencyKey) this.rememberIdempotency(`${principal.subject}|${idempotencyKey}`, {
+      turnId: turn.id,
+      inputHash,
+      sessionId: state.id,
+      ...(params.input.userMessageId ? { userMessageId: params.input.userMessageId } : {}),
+      ...(params.input.voiceOrigin ? { voiceOrigin: params.input.voiceOrigin } : {}),
+    });
     return { accepted: true, turn: this.toRacpTurn(state, turn), cursor: this.hub.stream(state.id).cursor() };
   }
 
@@ -512,11 +582,87 @@ export class AgentHost {
     return this.toRacpTurn(state, state.turns.get(turnId)!);
   }
 
+  /** Read-only, session-scoped reconciliation for an already issued request key. */
+  lookupTurnByIdempotency(
+    principal: Principal,
+    request: {
+      sessionId: string;
+      idempotencyKey: string;
+      userMessageId: string;
+      voiceOrigin: { callId: string; operationId: string };
+    },
+  ): RacpTurn | undefined {
+    this.requireRole(principal, "turn/get");
+    const { sessionId, idempotencyKey, userMessageId, voiceOrigin } = request;
+    if (!sessionId.trim() || !idempotencyKey.trim() || !userMessageId.trim()) return undefined;
+    const remembered = this.idempotency.get(`${principal.subject}|${idempotencyKey}`);
+    const rememberedMatches = remembered?.sessionId === sessionId &&
+      remembered.userMessageId === userMessageId &&
+      remembered.voiceOrigin?.callId === voiceOrigin.callId &&
+      remembered.voiceOrigin.operationId === voiceOrigin.operationId;
+    const queued = this.queue.list(sessionId).find((record) =>
+      record.idempotencyKey === idempotencyKey &&
+      record.userMessageId === userMessageId &&
+      record.voiceOrigin?.callId === voiceOrigin.callId &&
+      record.voiceOrigin.operationId === voiceOrigin.operationId,
+    );
+    const turnId = rememberedMatches ? remembered.turnId : queued?.id;
+    if (!turnId) return undefined;
+    const state = this.states.get(sessionId);
+    const turn = state?.turns.get(turnId);
+    if (state && turn?.sessionId === sessionId) return this.toRacpTurn(state, turn);
+    if (queued?.id === turnId) {
+      return {
+        id: queued.id,
+        sessionId: queued.sessionId,
+        status: "queued",
+        admission: "queue",
+        effectivePermissionMode: queued.effectivePermissionMode,
+        ...(queued.idempotencyKey ? { idempotencyKey: queued.idempotencyKey } : {}),
+      };
+    }
+    return undefined;
+  }
+
+  /** Capture the current Host-owned turn identity synchronously at ingress. */
+  observeWorkTarget(sessionId: string): { activeTurnId: string | null } {
+    const state = this.states.get(sessionId);
+    const active = state?.activeTurnId ? state.turns.get(state.activeTurnId) : undefined;
+    return { activeTurnId: active && isActive(active.status) ? active.id : null };
+  }
+
+  /** Read live work state without loading transcript history or message text. */
+  async workSnapshot(sessionId: string): Promise<AgentWorkSnapshot> {
+    const summary = await this.requireSession(sessionId);
+    const state = this.state(summary.id);
+    state.permissionMode = summary.permissionMode;
+    const active = state.activeTurnId ? state.turns.get(state.activeTurnId) : undefined;
+    const queue = this.queue.list(state.id).map((record, index) => ({ queueEntryId: record.id, position: index + 1 }));
+    const pendingApprovals = this.approvals.list(sessionId).length > 0;
+    const pendingInputs = state.pendingInputs.size > 0;
+    const activeStatus = active?.status;
+    const workState: AgentWorkSnapshot["state"] = pendingApprovals || activeStatus === "waiting_approval"
+      ? "waiting-permission"
+      : pendingInputs || activeStatus === "waiting_input"
+        ? "waiting-input"
+        : activeStatus !== undefined && isActive(activeStatus)
+          ? "running"
+          : "idle";
+    return {
+      sessionId: state.id,
+      mode: summary.mode,
+      state: workState,
+      ...(active ? { activeTurnId: active.id, activeTurnStatus: active.status } : {}),
+      queue,
+      revision: state.revision,
+    };
+  }
+
   async stopTurn(principal: Principal, turnId: string): Promise<RacpTurn> {
     this.requireRole(principal, "turn/stop");
     const state = this.stateForTurn(turnId);
     const turn = state.turns.get(turnId)!;
-    if (turn.status === "queued") return this.cancelQueued(state, turn);
+    if (turn.status === "queued") return this.cancelTurn(principal, turnId);
     if (isActive(turn.status)) await this.runtime.stop(state.id);
     return this.toRacpTurn(state, turn);
   }
@@ -525,7 +671,7 @@ export class AgentHost {
     this.requireRole(principal, "turn/interrupt");
     const state = this.stateForTurn(turnId);
     const turn = state.turns.get(turnId)!;
-    if (turn.status === "queued") return this.cancelQueued(state, turn);
+    if (turn.status === "queued") return this.cancelTurn(principal, turnId);
     if (isActive(turn.status)) await this.runtime.abort(state.id, turn.runtimeTurnId ?? turn.id);
     return this.toRacpTurn(state, turn);
   }
@@ -533,12 +679,14 @@ export class AgentHost {
   async cancelTurn(principal: Principal, turnId: string): Promise<RacpTurn> {
     this.requireRole(principal, "turn/cancel");
     const state = this.stateForTurn(turnId);
-    const turn = state.turns.get(turnId)!;
-    if (turn.status !== "queued") {
-      if (turn.status === "canceled") return this.toRacpTurn(state, turn);
-      throw racpError("CONFLICT", "only a queued turn can be canceled");
-    }
-    return this.cancelQueued(state, turn);
+    return this.withAdmission(state.id, async () => {
+      const turn = state.turns.get(turnId)!;
+      if (turn.deliveryPending || turn.deliveredIntoTurnId || turn.status !== "queued") {
+        if (turn.status === "canceled" && !turn.deliveryPending && !turn.deliveredIntoTurnId) return this.toRacpTurn(state, turn);
+        throw racpError("CONFLICT", "the queued message has already started; use Stop to stop the running turn");
+      }
+      return this.cancelQueued(state, turn);
+    });
   }
 
   /** Remove a collaboration delivery from both the live and durable queue. */
@@ -553,21 +701,55 @@ export class AgentHost {
     });
   }
 
-  /** Move a queued turn to the head of its session's queue ("send now"). */
+  /** Promote a queued turn to the end of its session's priority block ("send now"). */
   async prioritizeTurn(principal: Principal, turnId: string): Promise<RacpTurn> {
     this.requireRole(principal, "turn/prioritize");
     const state = this.stateForTurn(turnId);
-    const turn = state.turns.get(turnId)!;
-    if (turn.status !== "queued") {
-      throw racpError("CONFLICT", "only a queued turn can be prioritized");
-    }
-    await this.queue.moveToHead(state.id, turn.id);
+    return this.withAdmission(state.id, async () => {
+      const turn = state.turns.get(turnId)!;
+      if (turn.deliveryPending || turn.deliveredIntoTurnId || turn.status !== "queued") {
+        throw racpError("CONFLICT", "only a queued turn can be prioritized");
+      }
+      if (!(await this.queue.promote(state.id, turn.id))) {
+        throw racpError("CONFLICT", "the turn is already prioritized");
+      }
+      this.afterQueueMove(state, turn.id);
+      return this.toRacpTurn(state, turn);
+    });
+  }
+
+  /**
+   * Swap a queued turn with its adjacent plain-queue neighbour. A promoted
+   * entry, an entry already at that edge, or a missing entry is a no-op
+   * (`moved: false`). Reordering uses the same controller permission as
+   * prioritizing: RACP has no separate reorder operation.
+   */
+  async reorderTurn(
+    principal: Principal,
+    turnId: string,
+    direction: QueueReorderDirection,
+  ): Promise<{ moved: boolean }> {
+    this.requireRole(principal, "turn/prioritize");
+    const state = this.stateForTurn(turnId);
+    return this.withAdmission(state.id, async () => {
+      const turn = state.turns.get(turnId)!;
+      if (turn.deliveryPending || turn.deliveredIntoTurnId || turn.status !== "queued") {
+        throw racpError("CONFLICT", "only a queued turn can be reordered");
+      }
+      if (!(await this.queue.reorder(state.id, turn.id, direction))) return { moved: false };
+      this.afterQueueMove(state, turn.id);
+      return { moved: true };
+    });
+  }
+
+  /** Publish one queue move and let an idle session drain the new head. */
+  private afterQueueMove(state: SessionState, turnId: string): void {
     this.renumberQueue(state);
-    this.emit(state, "turn.queued", { turn: this.toRacpTurn(state, turn) }, { turnId: turn.id });
+    const turn = state.turns.get(turnId);
+    if (turn) this.emit(state, "turn.queued", { turn: this.toRacpTurn(state, turn) }, { turnId });
     this.notifyQueue(state.id);
     this.queue.resume(state.id);
     void this.drain(state.id);
-    return this.toRacpTurn(state, turn);
   }
 
   async respondApproval(principal: Principal, response: RacpApprovalResponse): Promise<RacpApprovalResult> {
@@ -649,19 +831,74 @@ export class AgentHost {
     return this.approvals.list(sessionId);
   }
 
+  /**
+   * Open interactive inputs of one session, oldest first: the same entries a
+   * late-attaching client reads as `snapshot().pendingInputs`, without a
+   * history read. The paired original request carries the runtime request id
+   * and tool call the answer has to be resolved against.
+   */
+  pendingInputRequests(sessionId: string): Array<{ input: RacpInputRequest; original: AskToolRequest }> {
+    return [...this.state(sessionId).pendingInputs.values()].map((entry) => ({
+      input: entry.request,
+      original: entry.original,
+    }));
+  }
+
+  /** The RACP view of a session the caller already fetched: its durable summary plus live state. */
+  describeSession(summary: SessionSummary): RacpSession {
+    const state = this.state(summary.id);
+    state.permissionMode = summary.permissionMode;
+    return this.toRacpSession(summary, state);
+  }
+
   queuedTurns(sessionId: string): RacpTurn[] {
     return this.queueEntries(sessionId).map((entry) => entry.turn);
   }
 
-  /** Queued turns with their prompts, in queue order. */
+  /** Queued turns with their prompts, in delivery order. */
   queueEntries(sessionId: string): QueueEntryView[] {
     const state = this.state(sessionId);
     return this.queue.list(sessionId).map((record) => ({
       turn: this.toRacpTurn(state, this.ensureTurn(state, record.id)),
       content: record.content,
       ...(record.sessionMessageId ? { sessionMessageId: record.sessionMessageId } : {}),
+      ...(record.userMessageId ? { userMessageId: record.userMessageId } : {}),
+      ...(record.voiceOrigin ? { voiceOrigin: record.voiceOrigin } : {}),
       ...(record.attachments ? { attachments: record.attachments } : {}),
+      ...(record.priority !== undefined ? { priority: record.priority } : {}),
     }));
+  }
+
+  /**
+   * Close one turn because its owner (Electron Main / the runtime) settled it.
+   *
+   * `ingest` only sees terminal *events*, and a real abort does not always
+   * produce one that is allowed to land: Main drops a terminal event for a turn
+   * it no longer owns (`isStaleTerminalEvent`), and the runtime need not emit one
+   * at all. The Host would then keep the turn active and never release the queue
+   * it holds, so the settlement itself closes the turn here. Idempotent: a turn
+   * that is already terminal only retries the drain.
+   */
+  endTurn(
+    sessionId: string,
+    turnId: string,
+    status: TurnRecord["status"],
+    options: { error?: NonNullable<TurnRecord["error"]> } = {},
+  ): void {
+    const state = this.state(sessionId);
+    const turn = state.turns.get(this.resolveTurnId(state, turnId));
+    if (turn && isActive(turn.status)) {
+      this.closeTurn(state, turn, {
+        status,
+        endedAt: new Date(this.clock.now()).toISOString(),
+        ...(options.error ? { error: options.error } : {}),
+        kind: turnEventKindForStatus(status),
+        payload: {},
+        meta: { turnId: turn.id },
+      });
+      return;
+    }
+    void this.drain(state.id);
   }
 
   /** Let the queue of an idle session run, e.g. after the runtime became free. */
@@ -673,6 +910,45 @@ export class AgentHost {
   // Internals
   // -------------------------------------------------------------------------
 
+  /**
+   * Apply one terminal turn state, release everything that turn held, publish
+   * it, and let the queue run. Both entry points — a terminal runtime event and
+   * a settlement reported by the turn's owner — funnel through here.
+   */
+  private closeTurn(
+    state: SessionState,
+    turn: TurnRecord | undefined,
+    outcome: {
+      status: TurnRecord["status"];
+      endedAt: string;
+      error?: NonNullable<TurnRecord["error"]>;
+      kind: Parameters<EventHub["publish"]>[0]["kind"];
+      payload: Record<string, unknown>;
+      meta: { turnId?: string; parentToolCallId?: string; nestedParentToolCallId?: string; agentName?: string };
+    },
+  ): void {
+    if (turn) {
+      turn.status = outcome.status;
+      turn.endedAt = outcome.endedAt;
+      if (outcome.error) turn.error = outcome.error;
+    }
+    if (turn === undefined || state.activeTurnId === turn.id) {
+      state.activeTurnId = undefined;
+    }
+    state.activeItems.clear();
+    state.status = "idle";
+    for (const closed of this.approvals.cancelForSession(state.id, state.revision + 1)) {
+      this.emit(state, "approval.resolved", closed, outcome.meta);
+    }
+    for (const [inputId] of state.pendingInputs) {
+      state.pendingInputs.delete(inputId);
+      this.emit(state, "input.resolved", { inputId, status: "canceled" }, outcome.meta);
+    }
+    this.emit(state, outcome.kind, outcome.payload, outcome.meta);
+    this.emitSessionChanged(state);
+    void this.drain(state.id);
+  }
+
   private notifyQueue(sessionId: string): void {
     if (!this.onQueueChange) return;
     try {
@@ -682,28 +958,28 @@ export class AgentHost {
     }
   }
 
-  private async drain(sessionId: string): Promise<void> {
-    if (this.draining.has(sessionId)) return;
-    this.draining.add(sessionId);
-    try {
-      await this.withAdmission(sessionId, () => this.drainAdmitted(sessionId));
-    } finally {
-      this.draining.delete(sessionId);
-    }
-  }
-
   private async drainAdmitted(sessionId: string): Promise<void> {
       while (true) {
         const state = this.state(sessionId);
         if (this.queue.isHeld(sessionId) || this.isOccupied(state)) return;
+        const head = this.queue.peek(sessionId);
+        const headTurn = head ? this.ensureTurn(state, head.id) : undefined;
+        if (headTurn?.deliveryPending) return;
+        if (headTurn?.deliveredIntoTurnId) {
+          if (!(await this.removeDeliveredInput(state, headTurn.id))) return;
+          continue;
+        }
         const record = await this.queue.shift(sessionId);
         if (!record) return;
         const turn = this.ensureTurn(state, record.id);
+        this.startingQueuedTurns.set(sessionId, turn);
         try {
           const started = await this.runtime.prompt({
             sessionId,
             content: record.content,
             ...(record.sessionMessageId ? { sessionMessageId: record.sessionMessageId } : {}),
+            ...(record.userMessageId ? { userMessageId: record.userMessageId } : {}),
+            ...(record.voiceOrigin ? { voiceOrigin: record.voiceOrigin } : {}),
             ...(record.attachments ? { attachments: record.attachments } : {}),
             effectivePermissionMode: record.effectivePermissionMode,
             ...(record.idempotencyKey ? { idempotencyKey: record.idempotencyKey } : {}),
@@ -717,7 +993,12 @@ export class AgentHost {
           state.activeTurnId = turn.id;
           state.status = "running";
           this.renumberQueue(state);
+          this.renumberQueue(state);
           this.notifyQueue(sessionId);
+          // The rest of the promoted block joins this turn as user input, so the
+          // messages stay adjacent instead of waiting for their own turns
+          // (ADR 0265). A runtime without steering keeps the previous behavior.
+          void this.deliverPromotedBlock(state, started.turnId);
           return;
         } catch (error) {
           turn.status = "failed";
@@ -731,8 +1012,127 @@ export class AgentHost {
           this.emit(state, "turn.failed", { turn: this.toRacpTurn(state, turn) }, { turnId: turn.id });
           this.renumberQueue(state);
           this.notifyQueue(sessionId);
+        } finally {
+          this.startingQueuedTurns.delete(sessionId);
         }
       }
+  }
+
+  private async drain(sessionId: string): Promise<void> {
+    if (this.draining.has(sessionId)) {
+      // The pass already running may have decided to stop before this request
+      // arrived — the session was still busy, or the queue had not been written
+      // yet. Dropping the request here is what strands a queue, so remember it
+      // and let the running pass take another look before it finishes.
+      this.drainPending.add(sessionId);
+      return;
+    }
+    this.draining.add(sessionId);
+    try {
+      do {
+        this.drainPending.delete(sessionId);
+        await this.withAdmission(sessionId, () => this.drainAdmitted(sessionId));
+      } while (this.drainPending.has(sessionId));
+    } finally {
+      this.draining.delete(sessionId);
+    }
+  }
+
+  /**
+   * Deliver the promoted entries that are still queued into the turn that just
+   * started, so "Send now" twice puts both messages in front of the model
+   * together instead of spreading them over two turns (ADR 0265).
+   *
+   * The runtime only accepts input for a turn whose run is live, so a refusal is
+   * retried a bounded number of times. Anything still undelivered stays queued
+   * and leaves at the next boundary as its own turn: the previous behavior is
+   * the fallback, never a lost prompt.
+   */
+  private async deliverPromotedBlock(state: SessionState, runtimeTurnId: string): Promise<void> {
+    const steer = this.runtime.steer?.bind(this.runtime);
+    if (!steer) return;
+    for (let attempt = 0; attempt < PROMOTED_DELIVERY_ATTEMPTS; attempt += 1) {
+      const head = await this.withAdmission(state.id, async () => {
+        const record = this.queue.peek(state.id);
+        if (!record || record.priority === undefined) return undefined;
+        const active = state.activeTurnId ? state.turns.get(state.activeTurnId) : undefined;
+        if (!active || active.runtimeTurnId !== runtimeTurnId) return undefined;
+        const turn = this.ensureTurn(state, record.id);
+        if (turn.deliveryPending || turn.deliveredIntoTurnId) return undefined;
+        turn.deliveryPending = true;
+        return record;
+      });
+      if (!head) return;
+      let accepted = false;
+      try {
+        ({ accepted } = await steer({
+          sessionId: state.id,
+          turnId: runtimeTurnId,
+          content: head.content,
+          ...(head.sessionMessageId ? { sessionMessageId: head.sessionMessageId } : {}),
+          ...(head.userMessageId ? { userMessageId: head.userMessageId } : {}),
+          ...(head.voiceOrigin ? { voiceOrigin: head.voiceOrigin } : {}),
+          ...(head.attachments ? { attachments: head.attachments } : {}),
+          principal: { subject: head.principalSubject, roles: ["controller"] },
+        }));
+      } catch {
+        // The runtime adapter reports transport failures; leave refused input queued.
+        accepted = false;
+      }
+      const cleaned = await this.withAdmission(state.id, async () => {
+        const turn = this.ensureTurn(state, head.id);
+        turn.deliveryPending = false;
+        if (!accepted) return true;
+        // Record acceptance before persistence: failed cleanup is never cancellation.
+        this.markDeliveredIntoAnotherTurn(state, head.id, runtimeTurnId);
+        return this.removeDeliveredInput(state, head.id);
+      });
+      // Completion may have tried to drain while this input was reserved.
+      void this.drain(state.id);
+      if (!cleaned) return;
+      if (!accepted) await delay(PROMOTED_DELIVERY_RETRY_MS);
+    }
+  }
+
+  /** Keep accepted inputs out of execution even when durable cleanup fails. */
+  private async removeDeliveredInput(state: SessionState, turnId: string): Promise<boolean> {
+    try {
+      await this.queue.remove(state.id, turnId);
+      this.renumberQueue(state);
+      this.notifyQueue(state.id);
+      return true;
+    } catch {
+      this.emit(state, "turn.activity", {
+        event: {
+          type: "error",
+          error: {
+            code: "INTERNAL",
+            message: "Delivered input could not be removed from the durable queue",
+            retriable: true,
+            traceId: "",
+          },
+        },
+      }, { turnId });
+      return false;
+    }
+  }
+
+  /**
+   * An injected entry never runs its own turn: its input was delivered into the
+   * turn that was already running, and the transcript rows come from that turn's
+   * steering messages. Its RACP turn is canceled so no client is left believing a
+   * queued turn is still waiting.
+   */
+  private markDeliveredIntoAnotherTurn(state: SessionState, turnId: string, runtimeTurnId: string): void {
+    const turn = state.turns.get(turnId);
+    // A delivered entry is queued, not active: it never occupied the session, so
+    // the check is "not already terminal" rather than `isActive`.
+    if (!turn || isTerminal(turn.status)) return;
+    turn.deliveredIntoTurnId = runtimeTurnId;
+    turn.status = "canceled";
+    turn.queuePosition = undefined;
+    turn.endedAt = new Date(this.clock.now()).toISOString();
+    this.emit(state, "turn.canceled", { turn: this.toRacpTurn(state, turn) }, { turnId: turn.id });
   }
 
   /** Keep busy checks and queue writes atomic across concurrent senders. */
@@ -749,6 +1149,9 @@ export class AgentHost {
   }
 
   private async cancelQueued(state: SessionState, turn: TurnRecord): Promise<RacpTurn> {
+    if (turn.deliveryPending || turn.deliveredIntoTurnId) {
+      throw racpError("CONFLICT", "the queued message has already started; use Stop to stop the running turn");
+    }
     const removed = await this.queue.remove(state.id, turn.id);
     if (removed || turn.status === "queued") {
       turn.status = "canceled";
@@ -804,7 +1207,7 @@ export class AgentHost {
     state: SessionState,
     kind: Parameters<EventHub["publish"]>[0]["kind"],
     payload: unknown,
-    meta: { turnId?: string; parentToolCallId?: string; agentName?: string },
+    meta: { turnId?: string; parentToolCallId?: string; nestedParentToolCallId?: string; agentName?: string },
   ): void {
     const durable = racpDurable(kind);
     if (durable) state.revision += 1;
@@ -815,6 +1218,7 @@ export class AgentHost {
       revision: state.revision,
       kind,
       ...(meta.parentToolCallId ? { parentToolCallId: meta.parentToolCallId } : {}),
+      ...(meta.nestedParentToolCallId ? { nestedParentToolCallId: meta.nestedParentToolCallId } : {}),
       ...(meta.agentName ? { agentName: meta.agentName } : {}),
       payload: this.boundPayload(payload),
     });
@@ -891,6 +1295,7 @@ export class AgentHost {
       status,
       createdAt: new Date(envelope.ts).toISOString(),
       ...(envelope.parentToolCallId ? { parentToolCallId: envelope.parentToolCallId } : {}),
+      ...(envelope.nestedParentToolCallId ? { nestedParentToolCallId: envelope.nestedParentToolCallId } : {}),
       ...(envelope.agentName ? { agentName: envelope.agentName } : {}),
       content,
     };
@@ -909,10 +1314,13 @@ export class AgentHost {
       expiresAt: new Date(this.clock.now() + this.approvalLifetime(state)).toISOString(),
       ...(envelope.agentName ? { agentName: envelope.agentName } : {}),
       ...(envelope.parentToolCallId ? { parentToolCallId: envelope.parentToolCallId } : {}),
+      ...(envelope.nestedParentToolCallId ? { nestedParentToolCallId: envelope.nestedParentToolCallId } : {}),
       questions: request.questions.map((question, index) => ({
         id: `${request.requestId}:${index}`,
         question: question.question,
-        options: question.options,
+        // RACP v1 keeps answer choices as labels; the desktop-only description
+        // remains local to the inline asktool card.
+        options: question.options.map(askToolOptionLabel),
         multiSelect: question.multiSelect ?? false,
       })),
     };
@@ -977,11 +1385,13 @@ export class AgentHost {
   private resolveTurnId(state: SessionState, runtimeTurnId: string): string {
     const alias = this.runtimeAliases.get(runtimeTurnId);
     if (alias) return alias;
-    // A queued turn that started before its prompt() call returned: adopt
-    // the runtime id for the head record so the two never diverge.
-    const head = this.queue.peek(state.id);
-    if (head && state.activeTurnId === undefined && !state.turns.has(runtimeTurnId) && this.draining.has(state.id)) {
-      return head.id;
+    // prompt() can emit events before returning its runtime id. The starting
+    // record has already left the queue; the new head belongs to another turn.
+    const starting = this.startingQueuedTurns.get(state.id);
+    if (starting && !starting.runtimeTurnId && !state.turns.has(runtimeTurnId)) {
+      starting.runtimeTurnId = runtimeTurnId;
+      this.runtimeAliases.set(runtimeTurnId, starting.id);
+      return starting.id;
     }
     return runtimeTurnId;
   }
@@ -1062,6 +1472,29 @@ function isActive(status: RacpTurn["status"]): boolean {
   return RACP_ACTIVE_TURN_STATUSES.includes(status);
 }
 
+/** A turn that can no longer change: canceled or settled by its own run. */
+function isTerminal(status: TurnRecord["status"]): boolean {
+  return !isActive(status) && status !== "queued";
+}
+
+/** The RACP event kind that publishes one terminal turn state. */
+function turnEventKindForStatus(
+  status: RacpTurn["status"],
+): Parameters<EventHub["publish"]>[0]["kind"] {
+  switch (status) {
+    case "completed":
+      return "turn.completed";
+    case "failed":
+      return "turn.failed";
+    case "interrupted":
+      return "turn.interrupted";
+    case "canceled":
+      return "turn.canceled";
+    default:
+      throw new Error(`turn status ${status} is not terminal`);
+  }
+}
+
 function racpDurable(kind: Parameters<EventHub["publish"]>[0]["kind"]): boolean {
   return kind !== "turn.activity" && kind !== "item.delta" && kind !== "tool.progress" && kind !== "terminal.output";
 }
@@ -1093,3 +1526,12 @@ export function hashInput(input: StartTurnParams["input"]): string {
 }
 
 export type { UiMessage };
+
+/** Bounded attempts to fold a promoted entry into the turn that just started. */
+const PROMOTED_DELIVERY_ATTEMPTS = 8;
+/** Gap between those attempts: the runtime accepts input once its run is live. */
+const PROMOTED_DELIVERY_RETRY_MS = 150;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

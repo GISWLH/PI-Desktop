@@ -30,6 +30,7 @@
 | `provider.register` | 高 | `contributes.providers` 成为原生 Provider 列表中的行，归插件所有并在每次加载时按 manifest 刷新 | 显式确认；v1.1 仅限本地导入和开发插件，与 `agent.extension` 一致 | 用户路径拒绝该行（`PROVIDER_OWNED_BY_PLUGIN`）；凭据仍存放在 Host secret store 的常规 provider 引用下；暂不启用 `oauth` 声明 |
 | `net.fetch` | 高 | `net.fetch` | 默认拒绝 | 限定在 `manifest.net.domains` 之内；列表为空或非法即完全不放行出网（§2A） |
 | `net.websocket` | 高 | `pi.net.websocket.connect` / `send` / `close`（套接字由宿主持有；每个插件最多 4 个，帧封顶 1 MiB） | 默认拒绝 | 与 `net.fetch` 一样被限制在 `manifest.net.domains` 之内；被拒绝的主机永远到不了传输层，插件卸载、被禁用或崩溃时每个套接字都会被关闭 |
+| `net.anyHost` | 高 | 主机掌握的所有出网路径（`net.fetch`、`net.websocket`、面板 session、远程 HTTP MCP） | 安装时确认 | 对用户自填端点（自建服务器等）解除 `manifest.net.domains` 白名单；云元数据端点始终拒绝；请求时不再弹窗 |
 | `shell.openExternal` | 中等 | 打开外部链接 | 首次使用时确认 | 防止网络钓鱼链接 |
 | `mcp.server.local` | 高 | 生成清单中声明的 `transport: "stdio"` MCP 服务器 | 默认拒绝 | 运行本地可执行文件；其工具到达代理 |
 | `mcp.server.remote` | 高 | 连接 `transport: "http"` MCP 服务器 | 默认拒绝 | 将工具参数发送到第三方端点；非回环 HTTP 不加密 |
@@ -49,7 +50,9 @@
 | `session.read.own` | 中等 | `pi.session.list`、`pi.session.get`、`pi.session.listMessages` | 安装时确认 | 只能读取本插件导入的会话；不能跨插件访问 |
 | `session.update.own` | 中等 | `pi.session.rename` | 安装时确认 | 只能重命名本插件拥有的活动导入会话 |
 | `session.delete.own` | 高 | `pi.session.delete` | 安装时确认 | 只能回收或清除本插件导入的会话；有频率限制 |
+| `usage.read` | 中等 | `pi.usage.listTurns` | 安装时确认 | 已完成 turn 事实行的只读列举（每回合 token 计数与标识符，keyset 分页）；不含消息正文，无写路径 |
 | `agent.complete` | 高 | `pi.agent.complete` | 安装时确认 | 宿主代发一次性补全；消耗用户额度；`includeSessionContext` 还需要 `session.read` |
+| `speech.adapter.register` | 高 | `pi.speech.registerAdapter` / `unregisterAdapter` | 安装时确认 | 注册语音协议。handle 留在插件进程；HTTP 计划由宿主用绑定密钥代发且必须同 origin |
 
 ## 2A. 权限是开关，manifest 承载范围
 
@@ -144,7 +147,9 @@ Agent，在 Plan 中不可见。主机返回 `PLUGIN_DISABLED_IN_PLAN`
 | `session.read.own` | Read sessions imported by this plugin | 读取此插件导入的会话 |
 | `session.update.own` | Rename sessions imported by this plugin | 重命名此插件导入的会话 |
 | `session.delete.own` | Trash or purge sessions imported by this plugin | 将此插件导入的会话移入回收站或清除 |
+| `usage.read` | Read usage statistics | 读取用量统计 |
 | `agent.complete` | Run a one-shot completion with your models | 用你的模型发起一次补全 |
+| `speech.adapter.register` | Register a speech adapter | 注册语音适配器 |
 | `audio.capture.background` | Use the microphone in the background | 后台使用麦克风 |
 | `audio.playback.background` | Play audio in the background | 后台播放声音 |
 | `keyboard.globalShortcut` | Register system-wide shortcuts | 注册系统级快捷键 |
@@ -170,14 +175,15 @@ assertPermission(pluginId, perm) {
 顺序固定 —— 后面的门只能拒绝，永远不能放宽：
 
 ```ts
-assertFsAccess(pluginId, mode, requestedPath) {
+assertFsAccess(pluginId, mode, requestedPath, sessionId) {
  assertPermission(pluginId, `fs.${mode}`)              // 已声明且已授予
- full = realpathWithinRoot(root(pluginId, mode), requestedPath)
+ full = realpathWithinRoot(root(pluginId, mode, sessionId), requestedPath)
  if (!full) throw NOT_FOUND | INVALID_ARGUMENT         // 先解析软链
  if (isDenied(full) || isHostReserved(full)) throw ERROR_PERMISSION_DENIED
  if (!inScope(full, declaredScope(pluginId, mode))) await confirmWithUser(...)
 }
 ```
+`workspace` 根是调用该调用的工具会话所属的项目，面板调用没有工具会话，回退到可见工作区（ADR 0266）。
 
 ## 7. 验收
 

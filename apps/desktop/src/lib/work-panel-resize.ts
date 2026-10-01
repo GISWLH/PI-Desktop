@@ -3,7 +3,7 @@
 // this only affects a new profile without a saved preference.
 export const WORK_PANEL_MIN_WIDTH = 244;
 export const WORK_PANEL_DEFAULT_WIDTH = 360;
-export const WORK_PANEL_CHAT_MIN_WIDTH = 1040;
+export const WORK_PANEL_CHAT_MIN_WIDTH = 800;
 export const WORK_PANEL_CHAT_MAX_WIDTH = 10000;
 /**
  * Hard MainChat floor for the in-flow three-column shell. The work panel may
@@ -44,6 +44,33 @@ export function clampWorkPanelWidth(
   min = WORK_PANEL_MIN_WIDTH,
 ) {
   return Math.max(workPanelWidthLimits(min).min, width);
+}
+
+/**
+ * Live bounds for a manual panel width: the compact minimum replaces the
+ * regular minimum while the panel is below it, and the shared three-column
+ * budget caps the growth. Pointer, keyboard, and reset paths share it so a
+ * reset can never breach the MainChat floor.
+ */
+export function workPanelWidthBounds(
+  panelMinimum = WORK_PANEL_MIN_WIDTH,
+  maxPanelWidth: number,
+) {
+  const minimum = Math.min(panelMinimum, maxPanelWidth);
+  return { minimum, maximum: Math.max(minimum, maxPanelWidth) };
+}
+
+/**
+ * Double-click reset for the panel separator: the default width, clamped to
+ * the live bounds, so a window narrower than the default keeps its budget cap.
+ */
+export function workPanelResetWidth(
+  panelMinimum = WORK_PANEL_MIN_WIDTH,
+  maxPanelWidth: number,
+) {
+  const { minimum, maximum } = workPanelWidthBounds(panelMinimum, maxPanelWidth);
+  const target = Math.min(Math.max(WORK_PANEL_DEFAULT_WIDTH, minimum), maximum);
+  return clampWorkPanelWidth(target, minimum);
 }
 
 export type WorkPanelLayout = {

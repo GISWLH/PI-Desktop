@@ -33,8 +33,9 @@ Principles:
 | `fs` | Work panel workspace file listing/reading/reveal, chat file-reference completion against the project, session scratch, and attachment roots, plus user-initiated open with the OS default handler (read-only) |
 | `window` | Frameless window state, controls, and compatibility work-panel geometry channels |
 | `menu` | Allowlisted application-menu commands and native editing/window actions |
-| `notification` | Durable inbox list/read/clear and new/activated events |
+| `notification` | Durable inbox list/read/clear, new/activated events, and native-notification sound cues |
 | `stats` | Completed-turn token history (host RPC; dashboard is plugin-owned) |
+| `voice/live` | App-owned real-time calls, secret-free status/settings DTOs, and per-call media ports |
 
 ## 3. Channel Conventions
 
@@ -56,6 +57,7 @@ Examples:
 - `pi-desktop/project/open`
 - `pi-desktop/project/pickFolders`
 - `pi-desktop/project/clone`
+- `pi-desktop/project/cloneCheckout`
 - `pi-desktop/project/openFolder`
 - `pi-desktop/project-group/list`
 - `pi-desktop/project-group/create`
@@ -148,7 +150,11 @@ name matches a loaded pi prompt template, the main-process handler expands
 the invocation (`parseCommandArgs` + `substituteArgs`) before persisting.
 The persisted user message stores `content = expanded text` plus an optional
 `command: string` field carrying the typed invocation for transcript
-display. Reseed replays `content`, so the agent context is identical across
+display. Explicit Skill invocations also persist validated `skillMentions`
+with UTF-16 offsets into `command`, allowing the transcript to show each
+Skill separately from the user's remaining text after reopening a session.
+These optional transcript metadata fields do not alter the model-facing
+`content`. Reseed replays `content`, so the agent context is identical across
 restarts. Builtin/plugin slash aliases never reach this channel — the
 renderer executes them locally. Unknown `/foo` passes through as literal
 content. Ordinary `@path` tokens are not transformed anywhere in the pipeline
@@ -167,13 +173,14 @@ The renderer changes those values through
 type ThinkingLevel =
   | "off" | "minimal" | "low" | "medium"
   | "high" | "xhigh" | "max";
+type SessionThinkingLevel = ThinkingLevel | "omit";
 
 type SessionConfigureRequest = {
   id: string;
   mode: "plan" | "goal" | "agent";
   providerId?: string;
   modelId?: string;
-  thinkingLevel: ThinkingLevel;
+  thinkingLevel: SessionThinkingLevel;
 };
 ```
 
@@ -195,13 +202,15 @@ content-addressed attachment store, and derives the effective model transport
 from the published model record plus the exact binding's `supportsImages`
 override. An absent or `null` override follows the published image capability;
 `true` enables and `false` disables image input for that configured model.
-Eligible images become transient pi-ai image blocks when the effective
-capability is enabled. Unknown/custom models without an explicit override,
-non-vision models, and images above the 10 MB inline bound receive a safe
-`@path` fallback.
-Main uses streamed hashing and file copying for images above that bound, and the
-sidecar uses the same bounded-read rule when rebuilding history. The durable
-user message stores `content` plus attachment metadata/ref, never base64.
+For a vision-capable model, images within the 10 MB per-image bound become
+transient pi-ai image blocks. Restored history also has a 30 MB aggregate raw
+image-byte budget: the sidecar considers persisted attachments newest-first and
+preserves every eligible image when the total fits. If the budget is exceeded,
+older images use the existing safe `@path` fallback. Unknown/custom models
+without an explicit image override, non-vision models, oversized images, and
+unavailable refs also use the safe fallback. Main uses streamed hashing and file
+copying for oversized images. The durable user message stores `content` plus
+attachment metadata/ref, never base64.
 Invalid attachment paths fail with `PATH_OUTSIDE_WORKSPACE`.
 
 Regenerate history (D109) also uses session channels:
@@ -213,11 +222,13 @@ Regenerate history (D109) also uses session channels:
 Root user turns may include `revisionRootId`, `revisionCount`, and
 `activeRevision`. Activating a revision replaces the live tail with
 `prefix + archived branch` and disposes the session agent.
-The sidecar receives only the prepared attachment subset needed for the
-current turn. On a vision runtime, persisted image refs are hydrated from the
-session-bound attachment/scratch roots when history is rebuilt; oversized or
-unavailable images remain path fallbacks. This keeps renderer, main, sidecar, the models.dev catalog, and host
-persistence on one capability-aware contract.
+The sidecar receives only the prepared attachment subset needed for the current
+turn. On a vision runtime, persisted refs are hydrated from session-bound
+attachment/scratch/project roots. The current prompt row is excluded by message
+id before hydration, so it does not consume the history budget; oversized,
+over-budget, or unavailable images remain safe path fallbacks. This keeps
+renderer, main, sidecar, the models.dev catalog, and host persistence on one
+capability-aware contract.
 
 ### 5.1a Steer an active turn
 
@@ -252,7 +263,7 @@ persisted marker protects accepted input from Smart Stop after renderer reload.
 A native Pi `message_end` may additionally carry the optional additive
 `replacesMessageId`: the provisional streaming row id whose durable SDK entry
 this event publishes. The renderer re-keys exactly that row (active, cache,
-retained, side chat) and a generic event without the field leaves every other
+retained) and a generic event without the field leaves every other
 row untouched. The field adds no event kind, RACP kind, or storage change.
 A user `message_end` can additionally
 carry `precedingAssistant`, a streaming snapshot that reserves the reply's
@@ -320,6 +331,18 @@ type AgentCompactResponse = { accepted: boolean };
 session. It is available even when automatic context protection is disabled.
 Missing provider/session configuration fails through the normal `AppError`
 envelope; an active turn or compaction returns `AGENT_BUSY`.
+
+`agent.compact` is a blocking summary request, not a status poll: the sidecar
+serializes the conversation into one prompt, streams one model summary, and may
+retry a transient failure. Its transport deadline is therefore derived from that
+budget — `(1 + 3) × 180s` stream watchdog `+ 14s` of retry backoff `+ 10s`
+slack — instead of the flat 130s default, which expired while the sidecar was
+still summarizing a large context (**D614**, issue #795). The host also treats a
+transport deadline as "unknown" rather than "failed": when the call times out it
+re-reads the session's durable record, and reports success when a new checkpoint
+landed, because the sidecar persists through host-core whether or not Electron
+received the reply. A verdict the sidecar itself reported (for example
+`CONTEXT_COMPACTION_FAILED`) is never reconciled this way.
 
 ### 5.5 Plan and Goal checkpoint approval
 
@@ -490,7 +513,7 @@ type AgentActivity =
      reason: "manual" | "threshold" | "overflow" }
  | { phase: "recovering"; since: number }
  | { phase: "retrying"; since: number; attempt: number;
-     retryDelayMs?: number; error?: AgentActivityError }
+     infinite?: boolean; retryDelayMs?: number; error?: AgentActivityError }
  | { phase: "waiting-subagents"; since: number; subagentCount: number;
      agents?: AgentActivityAgent[] };
 
@@ -509,7 +532,7 @@ type AgentStatus = {
 The Host owns the per-session prompt queue; the renderer mirrors it. A
 Send-while-running pushes through `pi-desktop/agent/queue/push` and the
 headless Agent Host module admits, orders, and drains the durable entries
-(`turn_queue`, schema v15). Every change is fanned out as
+(`turn_queue`, schema v18). Every change is fanned out as
 `pi-desktop/agent/event/queueChanged`.
 
 ```ts
@@ -526,6 +549,7 @@ type QueuedTurnSummary = {
   content: string;
   attachments?: AgentPromptAttachment[];
   position: number;   // 1-based queue position
+  priority?: number;  // set only for a promoted entry; the click order
   createdAt: string;
 };
 
@@ -533,16 +557,39 @@ type QueuedTurnSummary = {
 // pi-desktop/agent/queue/list       -> { entries: QueuedTurnSummary[] }
 // pi-desktop/agent/queue/remove     -> { ok: true }   (turnId)
 // pi-desktop/agent/queue/prioritize -> { ok: true }   (turnId; "send now")
+// pi-desktop/agent/queue/reorder    -> { moved: boolean } (turnId, direction)
 // pi-desktop/agent/event/queueChanged -> { sessionId, entries }
 ```
 
 `push` returns `AGENT_BUSY` with `queueFull` once a session holds eight
 entries and `IDEMPOTENCY_CONFLICT` when a key is reused with other input.
-`prioritize` moves an entry to the head without touching the running turn;
-the renderer's "send now" then requests a graceful stop so the entry starts
-at the next boundary. `remove` cancels an entry that has not started. A
-restored queue stays held until the desktop attaches as the owner, so a
-reboot never starts work unattended.
+`entries` arrive in delivery order: promoted entries first in ascending
+`priority` (the order they were promoted), then every remaining entry by
+`position`. `prioritize` appends an entry to the end of that priority block
+without touching the running turn, refuses an entry that already carries a
+priority with `CONFLICT`, and refuses a turn that is no longer queued. The
+renderer's "send now" then requests a graceful stop so the entry starts at
+the next boundary. `reorder` swaps one non-promoted entry with its adjacent
+non-promoted neighbour and reports `moved: false` for a promoted entry, a
+missing entry, or a block/queue edge; a promoted entry is never a neighbour.
+`remove` cancels an entry that has not started. A restored queue stays held
+until the desktop attaches as the owner, so a reboot never starts work
+unattended.
+
+The promoted block is delivered as adjacent messages rather than as separate
+turns: the first promoted entry starts the turn at the boundary and every later
+promoted entry is injected into that same turn through the steering channel
+(`pi-desktop/agent/steer` with the running turn's id), so the transcript shows
+the user rows one after another and the model answers once. An injected entry
+leaves the queue and its own turn is canceled because it never runs on its own.
+An entry the runtime refuses to accept stays queued and leaves at the next
+boundary as its own turn.
+
+The queue's delivery contract is frozen by ADR 0265. A turn's own settlement is
+authoritative for the queue: the terminal event can be dropped (a terminal event
+naming a turn Main no longer owns never reaches the module) or never emitted, so
+the settlement closes the turn inside the module and releases the queue the turn
+was holding.
 
 ### 5.7 Session collaboration projection
 
@@ -645,7 +692,8 @@ type AgentEvent =
      willRetry: boolean; fallback?: "retained_tail";
      mark?: { id: string; throughMessageId: string;
               generation: number; summaryTokens: number;
-              summarized: boolean };
+              summarized: boolean;
+              fallback?: "retained_tail" };
      error?: { code: string; message: string } }
  | { type: "error"; error: AppError }
  | { type: "status"; status: AgentStatus };
@@ -699,7 +747,9 @@ renderer's whole view of that compaction: `id`, the `throughMessageId` anchor th
 transcript row sits after, `generation` (how many checkpoints this session has
 installed), `summaryTokens` (the summary's estimated context cost), and
 `summarized` (`false` when the window rolled over without asking the model for a
-summary). The record itself is not carried — its summary and retained tail are
+summary), and `fallback` (`"retained_tail"` when summary generation failed and
+the checkpoint carries only a recovery notice plus a retained tail; the row
+labels it as a failed summary, never as a summary of N tokens). The record itself is not carried — its summary and retained tail are
 far larger than an event should be — and is instead read from
 `SessionDetail.compactions` on session open or fork.
 
@@ -710,9 +760,14 @@ context. Manual compaction never silently falls back.
 
 Provider `error` events may include bounded diagnostic fields in
 `AppError.details`: `phase` (`request` or `stream`), `providerStatus`,
-`providerCode`, `providerWaitMs`, `streamMs`, and `retryAttempt`. These fields
-are additive and redacted; they never carry credentials or an unrestricted
-provider response. A transient stream failure may be replayed once inside the
+`providerCode`, `providerWaitMs`, `streamMs`, `retryAttempt`, and, for a
+network failure, `networkCategory`, `networkCode`, `networkSyscall`,
+`networkHost` and `networkRoute` plus the request correlation fields
+`requestMessages`,
+`requestBytes` and `compactionGeneration`. These fields are additive and
+redacted; they never carry credentials or an unrestricted provider response,
+and the request fields are counts and byte sizes only. A transient stream
+failure may be replayed once inside the
 same turn without a terminal `error` event or a duplicate assistant message.
 The second failure emits the terminal normalized `STREAM_FAILED` error.
 
@@ -735,9 +790,14 @@ setup so a fast completion cannot beat the viewing-context update. Electron
 combines this hint with Main-owned window visibility/focus at the terminal event
 boundary. Missing, null, or mismatched context fails safe to notification. It
 also invokes
-`pi-desktop/notification/showNative({ id, sessionId, kind, title, body })` after
-localizing a new record, where `kind` is `"task" | "interactive"`. This
-Electron-only request never crosses into the host RPC domain.
+`pi-desktop/notification/showNative({ id, sessionId, kind, title, body, createdAt? })`
+after localizing a new record, where `kind` is `"task" | "interactive"` and
+`createdAt` is the durable task timestamp when available. Main keeps a
+`dismissedBefore` watermark for successful mark-all-read/clear actions and
+rejects task deliveries at or before that timestamp; individual acknowledgements
+use the durable id as a tombstone. This prevents a delayed renderer or host
+replay from resurfacing an already acknowledged banner. This Electron-only
+request never crosses into the host RPC domain.
 
 ```ts
 type AppNotification = {
@@ -779,9 +839,18 @@ Main sends two events:
   and recalculates the exact unread count. A terminal result already visible in
   the focused current chat, repeated terminal updates, and aborted turns emit
   nothing.
+- The durable `id` is the renderer and Electron native-delivery idempotency key.
+  A repeated `notification.changed` payload for an id already present in the
+  local list is a no-op; a delayed payload whose row was acknowledged or
+  cleared is ignored and must not recreate the row or its sidebar outcome.
 - `pi-desktop/notification/event/activated` after the user clicks Electron's
   native system notification. Renderer follows its existing session-selection
   path, including project activation for a project-bound session.
+- `pi-desktop/notification/event/sound` is a payload-free, one-way cue for a
+  plugin-native notification that Electron successfully showed. Renderer plays
+  the shared soft chime; the event carries no notification content and creates
+  no inbox row. Native task, interactive, and plugin banners are silent so the
+  in-app chime is not doubled by a platform-specific sound.
 
 Plugin-owned session mutations additionally emit
 `pi-desktop/session/event/changed` after a successful write. The renderer
@@ -811,11 +880,19 @@ and a shown notification restores/shows and focuses the window before emitting
 `activated`. No permission, scheduled-reminder, or plugin source enters the
 task notification contract. Native delivery is best-effort; the durable
 inbox remains authoritative when the OS suppresses a banner. On Windows,
-Electron Main registers `com.pi-desktop.app` as the process AppUserModelID
+Electron Main registers `net.aiuo.pi-desktop` as the process AppUserModelID
 before readiness and before any window is created. The ID matches the NSIS
 package identity so notification attribution, notification settings, taskbar
 grouping, and installed shortcuts resolve to `PI-Desktop`, never the stock
 Electron host.
+
+Task native objects are retained by durable notification id, with at most one
+live object per id. Replayed `showNative` requests do not create a second
+object. A successful `notification.markRead`, `notification.markAllRead`, or
+`notification.clear` closes matching task objects (and leaves an id tombstone
+long enough to reject late delivery); a failed host mutation does not dismiss
+the object optimistically. Interactive prompt notifications use a separate
+transient registry and are not affected by task inbox mutations.
 
 The viewing-session hint is advisory and fail-safe: missing, stale, hidden, or
 unfocused renderer state creates the durable notification. Suppression occurs
@@ -834,7 +911,7 @@ type SessionSummary = {
  modelId?: string;
  providerId?: string;
   mode: "plan" | "goal" | "agent";
- thinkingLevel: ThinkingLevel;
+ thinkingLevel: SessionThinkingLevel;
  supportsReasoning?: boolean;
  supportedThinkingLevels?: ThinkingLevel[];
  updatedAt: string;
@@ -898,8 +975,10 @@ Electron main enriches session list/get/create/fork/configure results with
 effective reasoning capability from the local models.dev record for that
 session's exact provider/API URL and model. Sessions without a pinned
 `providerId`/`modelId` inherit the app default provider/model for this
-enrichment only; the durable ids remain unset so later default-model changes
-still apply. An ID absent from the snapshot, or a session with no resolvable
+enrichment only. Desktop session create writes the then-current default (or an
+explicit Composer draft override) into the durable ids; later default-model
+changes do not rewrite an already created session. A home draft with no session
+still follows the live default. An ID absent from the snapshot, or a session with no resolvable
 default, gets `supportsReasoning: false` and `off`; cached/provider claims do
 not replace catalog semantics. The Rust host remains authoritative only for the
 durable `thinkingLevel`.
@@ -980,7 +1059,7 @@ Minimal interface:
   directory, creates it if missing, and opens it in the system file manager.
   The renderer supplies only the session id; Main rejects a path outside the
   scratch root.
-- `session/importScan`
+- `session/importScan -> { sessions, truncated? }`
 - `session/importRun(candidates) -> { imported, skipped, failed }`
 - `modelConfig/importScan -> { providers }`
 - `modelConfig/importRun(candidates) -> { imported, skipped, failed }`
@@ -990,13 +1069,17 @@ Import candidates carry `projectPath: string | null` and
 importer's sampled-scan threshold; larger files are sampled (head + tail) so
 scanning a multi-gigabyte archive stays interactive, and their `messageCount`
 is null — the import list renders an em dash for it, while imported sessions
-always compute their real message count at convert time. Scan titles come
+always compute their real message count at convert time. Codex discovery also
+caps traversal at 250 session files, walking `YYYY/MM/DD` paths newest-first
+(path date, not `updatedAt`). Hitting that cap sets `truncated.codex` to 250
+so the renderer can say the list is incomplete. Scan titles come
 from the first real user message: known synthetic injections (repo
 instructions, the IDE-context family such as `# Context from my IDE setup:`
 or `# Browser comments:`) are skipped, while pasted markdown starting with
 `#` is kept. A corrupt or out-of-range stored timestamp falls back to the
 source file's mtime, never to the import moment. A successful import
 refreshes both sessions and the durable Projects index.
+
 
 `modelConfig/importScan` reads Claude Code, Codex, OpenCode, Pi, and CC
 Switch config files from the user home directory and returns public provider drafts
@@ -1023,8 +1106,12 @@ configuration.
 `session/fork` is a protocol-v5 channel that creates an independent
 session from the source session's current active transcript. When optional
 `throughMessageId` is present, the copied snapshot ends at that message; an
-unknown id returns `NOT_FOUND`. Electron rejects
-the request with `AGENT_BUSY` while that source session has an active turn.
+unknown id returns `NOT_FOUND`. While a Desktop source has an active turn,
+`throughMessageId` may select an already-completed assistant prefix containing
+no messages owned by a running turn. The host validates this under its RPC lock;
+whole-session and active-turn forks still return `AGENT_BUSY`. Native Pi forks
+retain their existing idle/ownership guard. The source continues running when
+the child is activated; the renderer never reloads history over its live tail.
 Electron owns localization and supplies the user-facing branch title; the host
 fallback title is reserved for non-UI callers.
 The host assigns a new session id, message ids, and tool-call ids; it copies
@@ -1098,8 +1185,9 @@ Non-sensitive config that can be returned to the UI:
   tools disabled
 - optional `AppSettings.networkProxy` (`system` / `direct` / `custom` plus a
   proxy URL and bypass list). Absent means System. Custom accepts `http`,
-  `https`, `socks5`, and `socks5h` URLs. Main applies Chromium
-  `session.setProxy` and Node env immediately; the agent sidecar is
+  `https`, `socks5`, and `socks5h` URLs, including userinfo. Main applies
+  Chromium `session.setProxy` (credentialed URLs through a loopback SOCKS5
+  relay; issue #490) and Node env immediately; the agent sidecar is
   reconfigured without a process restart. `pi-desktop/network/testProxy`
   runs one bounded Chromium fetch through the supplied config and does not
   persist it.
@@ -1227,6 +1315,10 @@ authorization code. `accountLabel` is a display string.
   changing the active workspace
 - `project/clone({ url })`: pick a parent directory, `git clone` the URL into
   it, and return the cloned workspace (the renderer then activates it)
+- `project/cloneCheckout({ url, parentPath })`: `git clone` a public remote
+  into an explicit parent folder and return `{ path, name }` without changing
+  the active workspace; the Create project dialog uses it before it creates the
+  logical project group
 - `project/openFolder(path)`: open a known project directory in the system file
   manager
 - `project/get()`: current workspace
@@ -1388,6 +1480,35 @@ project records from the global set by id or case-insensitive label before it
 filters disabled records, so a disabled project record still shadows a global
 one. The desktop-only `mcp/test` IPC action forces one connection test and
 returns its status to the MCP editor.
+The desktop's `mcp.list` IPC response probes previously ready remote connections
+before reporting their status. If a server no longer responds, its row reports
+`failed` instead of retaining a stale `ready` status; Test connection retries it. A failed settings probe does not interrupt an in-flight tool call; Test connection closes the old client before retrying.
+Stopping a session aborts its in-flight user MCP tool calls. The client sends
+`notifications/cancelled` for each active request without closing a connection
+used by other sessions; a completed or canceled tool call is never replayed.
+Cancellation stops the local wait, while a server may ignore the notification
+and finish an already started side effect.
+
+Desktop-only channels scan configuration written by other agent tools on the
+same machine — Claude Desktop (`claude_desktop_config.json` on macOS, Windows
+and Linux), Claude Code (`~/.claude.json` and `~/.claude/settings.json` merged),
+Cursor global and per-project `mcp.json`, Codex (`~/.codex/config.toml`
+`[mcp_servers.*]`), opencode (`~/.config/opencode/opencode.json` `mcp` map) —
+so the user can review and batch-import into this app's MCP list. ChatGPT
+desktop is listed as a placeholder because it has no public configuration path
+yet.
+
+- `pi-desktop/mcp/importScan` — `{ projectPath? }` →
+  `{ candidates: ExternalMcpCandidate[], sources: ExternalMcpSourceReport[] }`.
+  Missing files, ENOENT and parse errors surface on `sources[].error`; one bad
+  source never fails the scan. Per-source de-duplication keeps the cross-source
+  copies so the user can pick which install to import.
+- `pi-desktop/mcp/importRun` — `{ items: ExternalMcpImportItem[] }` →
+  `{ imported, skipped, failed }`. Main calls `mcp.upsert` once per item,
+  omitting `disabled` from the server payload and following up with
+  `mcp.setEnabled({ enabled: false })` when the source marked the server
+  disabled. One failure never blocks the rest; conflicts land in `skipped`
+  and every other error lands in `failed`.
 
 ```ts
 type McpServerStatus = {
@@ -1418,8 +1539,12 @@ one-liner.
 - `skills.list({ level, projectPath? })` → `{ skills: UserSkillRecord[] }`
 - `skills.active({ projectPath? })` → the effective runtime list
 - `skills.create(skill)`
-- `skills.import({ path, level, projectPath? })` — one source file is physically
-  copied into the selected `.agents/skills` directory
+- `skills.import({ path, level, projectPath?, shape?, mode?, id?, name?, description? })`
+  — imports one Markdown skill. `shape` is `"file"` (default when `path` is a
+  regular file) or `"dir"` (Anthropic-style `<name>/SKILL.md` plus resources).
+  `mode` is `"copy"` (default, byte-for-byte replica so a moved or deleted
+  source cannot break the skill) or `"link"` (symlink so external edits appear
+  on the next scan; `SKILL_INVALID` if the OS or file system refuses a symlink).
 - `skills.update({ id, ...skill })`
 - `skills.read({ id, level?, projectPath? })` → `{ skill, body }`
 - `skills.remove({ id, level?, projectPath? })`
@@ -1430,12 +1555,62 @@ Only the description enters the prompt, and the body is fetched when the model
 invokes `Skill` (D174). A missing file is removed from the list and its local
 state is pruned during the next scan.
 
+The desktop `pi-desktop/skill/import` channel keeps the file picker
+single-select and returns `{ skill }` for that path. With
+`sourceKind: "dir"`, it lets the user select multiple directories and returns
+`{ imported: UserSkillRecord[], failed: { path, error }[] }`. Cancellation
+returns `{ canceled: true }` for either picker. Main calls `skills.import`
+separately for each selected directory so one error cannot roll back the
+others. After a successful folder import, Main stores the parent of the
+last successfully imported source folder in machine-local app data. The next
+directory picker opens there while that parent still exists. Cancellation and
+all-failed batches do not replace this preference.
+
+Desktop-only channels scan skill folders written by other agent tools on this
+machine — `~/.claude/skills/`, `<project>/.claude/skills/`, and the app's own
+`~/.agents/skills/` (or `PI_DESKTOP_AGENTS_DIR/skills/`) plus its project
+equivalent — so the user can review candidates and batch-import them. Both the
+single-file (`<id>.md`) and Anthropic-style directory (`<name>/SKILL.md`)
+shapes are detected.
+
+- `pi-desktop/skill/importScan` — `{ projectPath? }` →
+  `{ candidates: ExternalSkillCandidate[], sources: ExternalSkillSourceReport[] }`.
+  Missing directories and read errors surface on `sources[].error`; one failing
+  source never aborts the scan. Candidates from `~/.agents/skills/` carry an
+  "already in current registry" warning so the UI can filter or highlight them.
+- `pi-desktop/skill/importRun` — `{ level, projectPath?, mode?, items }` →
+  `{ imported, skipped, failed }`. Main calls `skills.import` once per item,
+  passing `path = shape==="dir" ? rootDir : sourcePath` and forwarding `mode`
+  and per-item `id`/`name`/`description`. A conflict lands in `skipped` and
+  every other error lands in `failed`; one failure never blocks the rest. Batch
+  import is still bounded by `MAX_SKILLS` (128 per level).
+
 Desktop-only skill market channels (not host RPC) live on Electron IPC:
 
-- `pi-desktop/skill/market/search` — `{ query, sources[] }` → `{ entries, failedSources }`.
-  Main aggregates builtin-safe catalog JSON and GitHub repo SKILL.md scans.
-  Source URLs must pass the public-HTTPS policy (ADR 0243). One failing source
-  is dropped; the rest still return.
+- `pi-desktop/skill/market/search` — `{ query, sources[] }` →
+  `{ entries, failedSources, failureKinds, failureDetails }`. Main aggregates
+  builtin-safe catalog JSON and GitHub repo SKILL.md scans. Source URLs must pass
+  the public-HTTPS policy (ADR 0243). One failing source is dropped; the rest
+  still return. `failureKinds` maps each name in `failedSources` to `policy`
+  (the guard judged the target's own non-public address and refused it),
+  `fake-ip` (it judged a fake-IP placeholder the local proxy invented for the
+  name — Clash's `198.18.0.0/15`; it remains refused on a direct or unreadable
+  route by default, while the explicit `allowFakeIp` setting may permit only
+  the benchmark placeholder for a transparent router/TUN deployment),
+  `unresolved` (the local DNS lookup returned no answer, so no address was
+  judged), or `network`.
+  `unresolved` (the local DNS lookup returned no answer, so no address was
+  judged), or `network`.
+  `failureDetails` carries the same keys with the host that actually failed, the
+  address it resolved to, the guard's own `reason`, that address's class, and the
+  route the guard judged it on (`proxied`, `direct`, or `unknown` when the
+  transport reported no readable route, ADR 0272), which is what lets the panel
+  name *what* was refused — "your proxy answered github.com with 198.18.0.1" —
+  instead of only which source went quiet. A judged refusal and a fake-IP refusal
+  both surface as `NETWORK_POLICY_BLOCKED` (both are refusals the guard decided),
+  and an unanswered resolver as `NETWORK_RESOLVE_FAILED` (spec 08 §3.1); the
+  install sheet classifies a failed preview on those codes together with the
+  structured `reason`.
 - `pi-desktop/skill/market/fetch` — `{ entry }` → `{ name?, description?, body, resources? }`.
   Main fetches the document over the same policy, splits frontmatter, and may
   attach sibling `.md` files from a jsDelivr listing. The renderer installs
@@ -1448,10 +1623,47 @@ Desktop-only skill market channels (not host RPC) live on Electron IPC:
 Desktop-only MCP market channels (not host RPC) live on Electron IPC:
 
 - `pi-desktop/mcp/market/search` — `{ query?, sources[], more? }` →
-  `{ entries, failedSources, exhausted }`. Main validates source URLs, pins
-  each resolved public address, follows only bounded HTTPS redirects, and keeps
-  cursor state for browse and server-side search. One failed source does not
-  discard successful sources; the response and caches are bounded.
+  `{ entries, failedSources, exhausted }`. Main validates source URLs and asks
+  the Electron session for the route on every hop. Fully proxied hops use the
+  session transport; direct and unknown hops pin the resolved public address by
+  default, with explicit `allowFakeIp` limited to benchmark placeholders.
+  Redirects stay bounded HTTPS, browse/search cursors are retained, and one
+  failed source does not discard successful sources; responses and caches are bounded.
+
+### MCP OAuth (ADR 0283)
+
+Browser-based OAuth 2.1 authentication for HTTP MCP servers is handled in the Electron main process via non-blocking IPC invocations and an event stream:
+
+Discovery preserves authorization-server issuer paths, trying OAuth path insertion,
+OIDC path insertion, then OIDC path appending (root issuers use the two root URLs).
+The authorization request uses the initial 401 Bearer challenge's `scope`, otherwise
+all valid protected-resource `scopes_supported` entries, otherwise omits `scope`.
+Authorization-server scope catalogs do not add or select requested permissions.
+
+- `pi-desktop/mcp/oauth/start({ id, level?, projectPath? }) -> { ok: true, loginId }`
+  Initiates OAuth metadata discovery and PKCE authorization code flow. Returns immediately; user browser navigation and callback exchange proceed asynchronously in the background.
+- `pi-desktop/mcp/oauth/cancel({ loginId?, id? }) -> { ok: boolean }`
+  Aborts an in-flight authorization attempt, tears down the local loopback HTTP server, and cancels pending timers.
+- `pi-desktop/mcp/oauth/event` streams `McpOAuthLoginEvent` to the renderer:
+
+```ts
+type McpOAuthLoginEvent = {
+  loginId: string;
+  serverId: string;
+} & (
+  | { kind: "authUrl"; url: string; instructions?: string; opened: boolean }
+  | { kind: "progress"; message: string }
+  | { kind: "done"; status: McpServerStatus }
+  | { kind: "error"; message: string }
+  | { kind: "cancelled" }
+);
+```
+
+#### Status and Token Storage
+- `McpServerStatus` includes:
+  - `hasOauth: boolean` — whether the server has an encrypted OAuth secret stored in host-core (`secret:mcp:<serverId>:oauth`).
+  - `authRequired: boolean` — flags that a connection attempt or `tools/call` returned HTTP 401 Unauthorized and user re-authentication is required.
+- OAuth tokens (`accessToken`, `refreshToken`, `expiresAt`, `resource`, `clientId`, `redirectUris`) are persisted exclusively in host-core encrypted secrets under `secret:mcp:<serverId>:oauth` and never exposed to the renderer. Authorization-server endpoints must be HTTPS (loopback HTTP is the only exception). Token-endpoint error bodies stay in main-process logs and are not copied into renderer events.
 
 ## 12c. Subagent API (D202)
 
@@ -1467,6 +1679,8 @@ written into the Markdown file.
 - `agents.read(id)` → `{ subagent, body }`
 - `agents.remove(id)`
 - `agents.setEnabled(id, enabled)`
+- `agents.disabledBuiltins` → `{ disabled: string[] }`
+- `agents.setBuiltinEnabled(id, enabled)` → `{ id, enabled }`
 
 The `thinkingLevel` field accepted by `agents.create` and `agents.update` may
 be a canonical thinking level, `omit`, or the empty string. The empty string
@@ -1484,12 +1698,24 @@ The `tools` array may include the token `inherit` (ADR 0246). `inherit` alone
 is a valid grant; host-core must not drop the document. Settings round-trips
 the token as `tools: inherit` or `tools: [inherit, Bash]`.
 
+`agents.disabledBuiltins` and `agents.setBuiltinEnabled` carry activation for the
+shipped builtins, which have no document to switch (ADR 0270). Handles are stored
+at the global level in `<data>/agent-capabilities/subagent-builtins.json`, a file
+of its own: the user-document scan prunes state for ids it cannot see, and a
+builtin is never scanned, so a shared file would drop every builtin exclusion on
+the next scan. `agents.setBuiltinEnabled` normalizes the id the way a document
+name is normalized and rejects an empty one with `SUBAGENT_INVALID`; a handle no
+current builtin uses is stored inertly rather than refused, because host-core
+does not ship the builtin list.
+
 Electron's `subagent/list` IPC channel exposes the same global-only list to
 Settings > Agent > Subagents. `subagent/catalog` returns the effective Task
-catalog (enabled user documents merged with the five shipped builtins) so the
-page can render those defaults as read-only rows. The runtime catalog
-combines the same sources; it does not scan `.pi/agents` or any project
-capability directory.
+catalog — enabled user documents merged with the five shipped builtins, minus the
+builtins the user switched off — together with `builtins`: every shipped
+definition that still wins its handle, each carrying `enabled`, so the page can
+render a switched-off default as a row with its own switch. The runtime catalog
+combines the same sources and applies the same exclusions; it does not scan
+`.pi/agents` or any project capability directory.
 
 ## 12d. Capability level and local activation
 
@@ -1543,12 +1769,16 @@ Renderer IPC kept for the Plan-safe preview facade and URL fallback:
 
 - `browser/openExternal({url?})` — allowlisted http(s)/mailto, or the current
   guest URL when omitted
-- event: `browser/event/state {url, title, isLoading, canGoBack, canGoForward}`
+- Renderer plugin-view open/close requests may carry `sessionId` and `tabId`.
+  Open binds the resource tab after checking the plugin contribution and scope;
+  close releases only that tab's retained page (or the session's pages when no
+  tab id is supplied). The shared plugin chrome is not closed with a sibling page.
+- event: `browser/event/state {url, title, isLoading, canGoBack, canGoForward, loadError?, sessionId?, tabId?}`
   (also pushed to plugin views as `browser:state`)
 - agent preview event: `browser/event/preview {sessionId, path?, url?}`.
   Electron Main validates a workspace `path` inside that session's project,
-  loads the guest when that conversation's plugin view is visible, and the
-  renderer opens `plugin:pi.browser/browser` with `location` in the matching
+  asks the renderer to create a Browser resource tab before navigation, with
+  `location` in the matching
   runtime panel context. Navigation of a background session does not steal the
   visible guest.
 
@@ -1562,7 +1792,7 @@ Renderer IPC kept for the Plan-safe preview facade and URL fallback:
   `attachments/<sha256>` blobs and absolute paths already inside the
   workspace, `<data_dir>/scratch/`, or `<data_dir>/attachments/` are also
   accepted after a realpath check (D334 / ADR 0172), as is an absolute path in
-  another folder of the same project group (ADR 0249 §5, ADR 0252). A known
+  another folder of the same project group (ADR 0249 §5, ADR 0263). A known
   image extension wins over `mimeType`; extension-less blobs accept only the
   image MIME allowlist. Traversal, `~`, and other escapes are rejected
   (`INVALID_ARGUMENT`).
@@ -1571,10 +1801,14 @@ Renderer IPC kept for the Plan-safe preview facade and URL fallback:
   containment as `fs/read`. Never returns non-image bytes. Renderer-only;
   not a plugin host API.
 - `fs/reveal({path})` → reveal in Finder. Same containment as `fs/read`.
-- `fs/open({path})` → open with the OS default application. Same lexical
-  containment as `fs/read` (without the extra realpath step used by reads).
+- `fs/open({path, mimeType?})` → open an existing regular file with the OS
+  default application. It uses the same realpath containment as `fs/read`,
+  including rejection of symlink escapes. For a content-addressed
+  `attachments/<sha256>` blob declared as `video/mp4`, the host creates a
+  `.mp4` symlink inside its private app-data directory before the OS handoff,
+  so the extensionless blob has a media association without copying its bytes.
 - `fs/resolveRef({ref, sessionId?})` → `FsChatRefResolveResult`
-  (`{ match: FsChatRefMatch | null }`, the match naming the answering `root`
+  (`{ match: FsChatRefMatch | null, reason?: "outside-allowed-roots" }`, the match naming the answering `root`
   (`workspace` / `scratch` / `attachments`), the `relativePath` relative to that
   root, the absolute `absolutePath`, `matchedBy` (`exact-relative` /
   `exact-absolute` / `path-suffix` / `basename`), and — for a `workspace` match
@@ -1582,19 +1816,24 @@ Renderer IPC kept for the Plan-safe preview facade and URL fallback:
   that answered); `sessionId` selects the
   session whose scratch store is searched. Completes a file reference the agent
   printed in chat, because the renderer cannot see the session's own scratch
-  store: an absolute reference that already names a real file inside a known
-  root wins outright, and an `attachments/<sha256>` blob resolves against the
+  store: an absolute reference only matches that exact file inside a known
+  root, and an `attachments/<sha256>` blob resolves against the
   attachment store directly; otherwise the roots are searched in priority order
   — the open project first, the session's own scratch store
   (`<data_dir>/scratch/<sessionId>/`, ADR 0124) second, the attachment store
   last — and the first root that answers wins. The project is the folder group
   behind the open workspace (ADR 0249): its primary folder answers before its
-  other folders, which are then searched in the group's own order (ADR 0252),
+  other folders, which are then searched in the group's own order (ADR 0263),
   so a shorthand resolves in a sibling folder as readily as in the primary one,
   and the match names the folder that answered. Inside one root an exact path
   beats a shorthand; among shorthands the longest matching tail wins, then the
-  shallowest path. The files-panel ignore set applies. A reference that matches
-  nothing returns `match: null`; resolving never opens anything (ADR 0251).
+  shallowest path. Relative and indexed candidates must resolve to regular files
+  whose real paths remain inside their answering root; an exact path through an
+  escaping or dangling link cannot fall back to a same-name indexed file. The
+  files-panel ignore set applies. A reference that matches
+  nothing returns `match: null`; an absolute path outside every allowed root
+  also returns `reason: "outside-allowed-roots"`, without trying a same-name
+  file inside a root. Resolving never opens anything (ADR 0262).
 - `fs/list` stays workspace-only; traversal outside is rejected
   (`INVALID_ARGUMENT`).
 
@@ -1632,7 +1871,8 @@ a generic main-process command surface:
 type NativeMenuAction =
   | "undo" | "redo" | "cut" | "copy" | "paste" | "selectAll"
   | "reload" | "zoomIn" | "zoomOut" | "resetZoom"
-  | "toggleFullScreen" | "minimize" | "toggleMaximize" | "close";
+  | "toggleFullScreen" | "minimize" | "toggleMaximize" | "close"
+  | "restoreMainWindow" | "toggleMainWindow";
 
 menu/nativeAction({ action: NativeMenuAction })
   -> { maximized: boolean; fullScreen: boolean }
@@ -1733,6 +1973,26 @@ Window bounds persistence and display reconciliation therefore operate on the
 ordinary application bounds; there is no panel-specific width or x-offset
 reservation, and background artifacts cannot change visible window geometry.
 
+### Tray session shortcuts (ADR tray-session-shortcuts)
+
+- `pi-desktop/tray/setSessionPreferences({ sessionMeta, archivedProjectPaths, sort })`
+  returns `{ ok: true }`. `sessionMeta` maps IDs to optional boolean `pinned`
+  and `archived` flags plus a non-negative safe integer `order`. `sort` is
+  `recent`, `created`, `oldest`, `name`, or `manual`; the renderer mirrors the
+  sidebar's effective sort. Main validates the payload, strips unrelated
+  metadata, and rejects senders other than the current main window. The setter
+  is excluded from the local MCP catalog and persists nothing.
+- Main emits `pi-desktop/tray/event/sessionActivated { sessionId: string | null }`
+  after restoring/focusing the window, waiting for post-bootstrap
+  `menu/rendererReady`, and checking that the session still exists and is not
+  archived. Renderer enters normal session selection, including cross-project
+  navigation and unread acknowledgement. A null ID closes search, returns to
+  the conversation page, and expands the sidebar for View more. Merely opening
+  the menu is read-only.
+- Main reads existing Host session/inbox APIs, observes root runtime events and
+  successful session/inbox mutations, and combines them with the ephemeral
+  organization copy. No host protocol or storage schema changes.
+
 ## 13c. Composer input APIs (D123/D124/D197, ADR 0024/0059)
 
 Electron-only channels backing composer autocomplete and file references.
@@ -1766,6 +2026,17 @@ Templates load from `<workspace>/.pi/prompts/*.md` and
 `~/.pi/agent/prompts/*.md` (project wins name conflicts; short TTL cache).
 Without a workspace only user-global templates, builtins, and plugin
 commands return.
+
+A source that fails is not an empty command list (**D613**, issue #795).
+Submit-time resolution distinguishes three outcomes: a resolved
+builtin/plugin/extension command dispatches locally, a template, an unknown
+alias, and a command entry without a dispatchable id stay on the prompt path,
+and an unreadable source refuses the submission. The refusal is deliberate —
+with the source down the composer cannot prove `/compact` is not a builtin, and
+a control command sent to the model as literal text is acted on. The refusal
+keeps the draft, shows `chat.slashCommandSourceUnavailable`, and leaves the TTL
+cache cold so the next submit retries the read; a warm cache keeps resolving
+through a source blip.
 
 ### fs/index
 
@@ -1877,6 +2148,17 @@ This is an independent, one-shot completion with no session history, tools, or
 attachments. Electron main resolves the provider/model and credentials, so the
 renderer never receives a secret. Empty drafts, slash-command drafts, missing
 models, and provider failures return the common `Result` error envelope.
+
+### speech/getStatus, speech/transcribe, speech/synthesize
+
+```ts
+speech/getStatus() -> SpeechStatus
+speech/transcribe({ sessionId?, path, mimeType?, language? }) -> { text }
+speech/synthesize({ sessionId?, text, voice?, format? }) -> { path, mimeType, dataUrl? }
+```
+
+Host speech is independent of chat. Bindings live on `AppSettings.speech`.
+Audio bytes never enter the renderer. See spec `20-speech.md`.
 
 ### app/openFeedback (D313)
 
@@ -2059,3 +2341,95 @@ submissions remain distinct; SDK entry IDs are never rewritten. Desktop event
 semantics are unchanged. Native terminal completion follows SDK settlement,
 not intermediate retry/compaction loop ends. Native abort never invokes
 `replaceSessionMessages` and reloads durable detail after abort returns.
+
+### Provider ordering
+
+`pi-desktop/providers/reorder({ id, targetId, placement: "before" | "after" })`
+returns `{ ok: true }` and forwards to host `providers.reorder`. The sandboxed
+preload permits this channel through the shared IPC registry. Invalid placement
+or missing providers returns `INVALID_PARAMS`; configuration and defaults are
+unchanged. See [provider configuration](12-provider-config-schema.md).
+
+## 15. Cloud configuration sync
+
+The Settings → Cloud sync page uses the following renderer-to-Main channels;
+all are forwarded to the Host-owned `configSync.*` RPC methods:
+
+| IPC channel | Host method | contract |
+|---|---|---|
+| `pi-desktop/configSync/getState` | `configSync.getState` | redacted status, category selections, preview counts, and pending approval summaries |
+| `pi-desktop/configSync/test` | `configSync.test` | WebDAV capability probe using a temporary object; no configuration is persisted |
+| `pi-desktop/configSync/configure` | `configSync.configure` | validates the endpoint, stores encrypted local sync metadata, and enables the vault |
+| `pi-desktop/configSync/syncNow` | `configSync.syncNow` | runs one Host-owned reconciliation cycle |
+| `pi-desktop/configSync/pause` | `configSync.pause` | pauses or resumes this device only |
+| `pi-desktop/configSync/unlock` | `configSync.unlock` | unlocks the local vault for the current process/device |
+| `pi-desktop/configSync/approve` / `reject` | `configSync.approve` / `configSync.reject` | records a digest-bound local activation decision |
+| `pi-desktop/configSync/mapProject` | `configSync.mapProject` | binds one opaque project/group identity to one or more explicitly selected local folders, preserving primary-root order |
+| `pi-desktop/configSync/listHistory` | `configSync.listHistory` | lists redacted reachable revision metadata only |
+| `pi-desktop/configSync/restore` | `configSync.restore` | creates a new propagated revision from an explicitly acknowledged historical revision and stages local approvals/recovery |
+| `pi-desktop/configSync/changePassword` | `configSync.changePassword` | CAS-rewraps the vault key header without returning keys or secret values |
+| `pi-desktop/configSync/disconnect` | `configSync.disconnect` | removes local sync metadata and keys; it does not delete remote vault data |
+
+Input passwords are accepted only for the operation that needs them. No raw
+secret, vault key, decrypted resource, or remote archive crosses back to the
+renderer. The `configSync.changed` event carries the same redacted state and
+is emitted by Host-originated changes, including the Host scheduler. Main is a
+transport/lifecycle coordinator and does not schedule, merge, encrypt, or
+apply configuration.
+
+A manual sync reports `configSync.progress` while it runs: the phase
+(`capture`, `download`, `merge`, `upload`, `apply`, or `cleanup`), the units
+done and total for that phase, and the bytes when they are known. A long upload
+of many resource objects is therefore not an interface with nothing to show.
+Background polls report nothing, since only the manual path has a caller
+watching.
+
+## 16. Live Voice API
+
+Live Voice is an app-owned call path described in [live-voice.md](live-voice.md)
+whose ownership is bound to the main window. Its DTOs are defined in
+`packages/shared/src/types/live-voice.ts`; the preload exposes only the
+allowlisted channels below. Main derives the owner from the invoking trusted
+frame and sends call events only to that frame. No payload can supply an owner
+identity or credentials. The docked widget window draws the call chrome without
+owning the call, so its three channels are validated separately and never enter
+owner derivation.
+
+| IPC channel | Direction | contract |
+|---|---|---|
+| `pi-desktop/voice/live/status` | Renderer → Main | redacted feature status, binding readiness and settings revision |
+| `pi-desktop/voice/live/prepare` | Renderer → Main | idempotent call preparation by request ID; synchronously reserves the shared microphone lease |
+| `pi-desktop/voice/live/connect` | Renderer → Main | connects a prepared call; Codex may include a bounded SDP offer |
+| `pi-desktop/voice/live/setMuted` | Renderer → Main | sets mute state with a monotonically increasing capture epoch |
+| `pi-desktop/voice/live/reportMedia` | Renderer → Main | reports capture, connection and release lifecycle; release acknowledgement is required before lease reuse |
+| `pi-desktop/voice/live/reportPlayback` | Renderer → Main | bounded list of played PCM cursors used for interruption/truncation |
+| `pi-desktop/voice/live/reportDelegation` | Renderer → Main | reports a provider-requested delegation; v1 rejects execution and never forwards it to Agent/MCP |
+| `pi-desktop/voice/live/reportControlApplied` | Renderer → Main | acknowledges a supported provider control or a rejected unsupported action |
+| `pi-desktop/voice/live/end` | Renderer → Main | idempotently ends an active call or cancels its pending request |
+| `pi-desktop/voice/live/heartbeat` | Renderer → Main | keeps the owning call alive while its renderer is responsive |
+| `pi-desktop/voice/live/event/changed` | Main → Renderer | redacted call phase, error, notice and activity updates |
+| `pi-desktop/voice/live/event/port` | Main → Renderer | transfers exactly one call-scoped `MessagePort` with its call ID and one-time nonce |
+| `pi-desktop/voice/live/event/control` | Main → Renderer | provider control request, limited to the explicit v1 control vocabulary |
+| `pi-desktop/voice/live/event/transcript` | Main → Renderer | transient bounded transcript event for the current call |
+| `pi-desktop/voice/live/widget/visibility` | Widget → Main | the docked widget's own presentation decision and the content box it needs; Main shows or hides that window accordingly |
+| `pi-desktop/voice/live/widget/action` | Widget → Main | a call action pressed in the docked widget; Main validates the sender and forwards it to the owner frame, which runs it |
+| `pi-desktop/voice/live/widget/issue` | Main window → Main | the owner frame's own failure code for its call (for example a refused mute), which the call view never carries |
+| `pi-desktop/voice/live/event/widgetState` | Main → Widget | the authoritative call view plus the owner's failure code, pushed to the docked widget window |
+| `pi-desktop/voice/live/event/widgetAction` | Main → Main window | the forwarded widget action the owner frame has to run |
+
+The `MessagePort` is provisioned only after successful owner validation, then
+relayed by preload to the renderer window. The owner echoes the per-call nonce
+in its first `hello`; Main accepts the port once and only after the call ID and
+nonce match the prepared call. Its binary frames are bounded PCM audio, capture
+epochs, release acknowledgements, playback cursors and protocol readiness
+signals. It is not a generic IPC tunnel: it carries no provider
+credentials, arbitrary commands, workspace paths, Agent messages or durable
+transcripts. A port is closed on call end or owner loss.
+
+The docked widget window is not a call owner and can never become one: it is
+refused on every owner-validated channel with `PERMISSION_DENIED`, exactly like
+any other renderer. Main answers its two channels only when the sender is that
+window, and the owner's own failure code arrives through the main window, which
+is the frame that ran the action. A widget action never changes call state by
+itself: it is forwarded to the owner frame, and the resulting state reaches the
+widget through the same authoritative view the owner receives.

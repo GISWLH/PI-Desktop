@@ -7,6 +7,12 @@
 /*
   Global search (Codex-style ⌘K spotlight): top-anchored dialog over a dimmed
   scrim. Same floating-surface family as .dialog; rows reuse the menu idiom.
+
+  The ⌘K spotlight keeps one veil in both palettes. §8.4/D148 give the light
+  theme ~28% ink so white dialogs do not sit under a heavy veil; tokenizing this
+  value would either change built-in light paint or record a value the design
+  system does not own, so it stays a literal and is listed as an explicit
+  exemption in scripts/style-surface-tokens.mjs (issue #341).
 */
 .search-overlay {
   position: fixed;
@@ -173,6 +179,9 @@
   Same floating-surface family as the elevated menus: elevated-opaque plate,
   subtle 1px ring, dialog shadow. Variants tint the leading icon only —
   surfaces stay neutral (restraint principle).
+  The stack is hosted on the body (Toast.tsx), so `z-toast` outranks the
+  `z-dialog` (40) overlay host the dialogs are portaled into; inside the shell
+  it would paint under their scrim.
 */
 .toast-viewport {
   position: fixed;
@@ -310,7 +319,9 @@
 }
 
 .release-notes-overlay {
-  z-index: 80;
+  /* z-dialog, like every other overlay: leaf popups (60) and toasts (50) keep
+     painting above it. */
+  z-index: 40;
 }
 
 .release-notes-dialog {
@@ -729,10 +740,6 @@
 :root[data-platform="linux"] .page-frame,
 :root[data-platform="darwin"] .page-frame {
   padding-top: calc(var(--ds-toolbar-height) + 8px);
-}
-
-.route-page > .thread-scroll {
-  flex: 1;
 }
 
 .chat-error-layer {

@@ -1,5 +1,9 @@
+import { activityTimingInputs, cachedVisibleActivityItems } from "../../../lib/transcript-activity-summary";
+import { reuseReferences } from "../../../lib/transcript-summary";
+import { ActivityItems } from "./ActivityItems";
+import { DisclosureScope, disclosureKey } from "./disclosure";
+import { ProcessActivityGroup } from "./ProcessActivityGroup";
 import {
-  Fragment,
   memo,
   useContext,
   useEffect,
@@ -26,7 +30,6 @@ import {
 } from "../../../lib/assistant-turns";
 import {
   delegationRoster,
-  delegationRosterOutcome,
   delegationRosterSummary,
   collectDelegationStatuses,
   collectDelegationTimings,
@@ -42,24 +45,23 @@ import {
   getToolAction,
   getToolSummary,
 } from "../../../lib/tool-display";
-import type { LiveTokenRate } from "./hooks/useLiveTokenRate";
-import { ReviewChangeCard } from "../../../components/ReviewChangeCard";
 import { IconChevronRight, IconCircleAlert, IconSparkles, IconWorkflow } from "../../../components/icons";
 import {
   DisclosureCollapseRail,
   TOOL_RUNNING_KEYS,
-  ThinkingRow,
   useAutomaticDisclosure,
 } from "./shared";
-import { SubagentTopology } from "./SubagentDetail";
-import { ToolRow } from "./ToolRow";
 import { TranscriptSearchContext } from "../../../lib/transcript-search-context";
+import type { LiveTokenRate } from "./hooks/useLiveTokenRate";
+import { useAppStore } from "../../../stores/app-store";
+import { resolveThinkingDisplayMode } from "../../../lib/turn-process";
 
 type Translate = (key: string, options?: Record<string, unknown>) => string;
 
 type ActivityItem = AssistantActivityItem;
 
 export function activityItemDetail(item: ActivityItem): string {
+  if (item.kind === "hostedSearch") return item.round.query ?? "";
   if (item.kind === "thinking") {
     // Latest thought line, so a collapsed header reads like a live ticker.
     const lines = thinkingText(item.message)
@@ -137,7 +139,7 @@ export function runActivityLabel(
       return t("chat.retryingModel", {
         delaySeconds: retryDelaySeconds(activity, now),
         attempt: activity.attempt,
-        maxAttempts: PROVIDER_RETRY_MAX_RETRIES,
+        maxAttempts: activity.infinite ? "∞" : PROVIDER_RETRY_MAX_RETRIES,
       });
     case "waiting-subagents":
       return waitingSubagentsLabel(activity, t);
@@ -146,8 +148,11 @@ export function runActivityLabel(
 
 type ActivityGroupProps = {
   items: ActivityItem[];
+  embedded?: boolean;
   isActive: boolean;
   endedAt?: string;
+  /** Last activity chunk of this assistant turn. */
+  isLast?: boolean;
   /** Current runtime wait phase, when the group owns the live turn tail. */
   runtimeActivity?: AgentActivity;
   /** Delegation statuses from the entire assistant turn (cross-activity-part). */
@@ -161,11 +166,15 @@ export function activityItemsEqual(
   previous: ActivityItem,
   next: ActivityItem,
 ): boolean {
+  if (previous === next) return true;
   if (previous.kind !== next.kind || previous.message !== next.message) {
     return false;
   }
   if (previous.kind === "tool" && next.kind === "tool") {
     return subagentRunsEqual(previous.delegate, next.delegate);
+  }
+  if (previous.kind === "hostedSearch" && next.kind === "hostedSearch") {
+    return previous.round === next.round;
   }
   return true;
 }
@@ -175,40 +184,56 @@ function activityGroupPropsEqual(
   next: ActivityGroupProps,
 ) {
   if (
+    previous.embedded !== next.embedded ||
     previous.isActive !== next.isActive ||
     previous.endedAt !== next.endedAt ||
+    previous.isLast !== next.isLast ||
     previous.runtimeActivity !== next.runtimeActivity ||
     previous.items.length !== next.items.length
   ) {
     return false;
   }
   if (
+    previous.items !== next.items &&
     !previous.items.every((item, index) =>
       activityItemsEqual(item, next.items[index]),
     )
   ) {
     return false;
   }
-  // Text updates rebuild the turn's delegation maps. Only Task groups consume
-  // those maps; ordinary completed work must retain its render boundary.
+  // Only Task groups consume the turn-wide delegation maps. Ordinary completed
+  // work must retain its render boundary when another group's tools update.
   return (
-    !previous.items.some(isDelegationActivityItem) ||
     (previous.turnDelegationStatuses === next.turnDelegationStatuses &&
-      previous.turnDelegationTimings === next.turnDelegationTimings)
+      previous.turnDelegationTimings === next.turnDelegationTimings) ||
+    !previous.items.some(isDelegationActivityItem)
   );
 }
 
 export const ActivityGroup = memo(function ActivityGroup({
   items,
+  embedded: _embedded = false,
   isActive,
   endedAt,
+  isLast = false,
   runtimeActivity,
   turnDelegationStatuses,
   turnDelegationTimings,
 }: ActivityGroupProps) {
+  const compact = useAppStore(
+    (state) => resolveThinkingDisplayMode(state.settings?.thinkingDisplayMode) === "compact",
+  );
   const { t } = useTranslation();
   const detailsId = useId();
-  const delegateItems = items.filter(isDelegationActivityItem);
+  const rawDelegateItems = useMemo(() => items.filter(isDelegationActivityItem), [items]);
+  const delegatesRef = useRef(rawDelegateItems);
+  const delegateItems = reuseReferences(delegatesRef.current, rawDelegateItems);
+  delegatesRef.current = delegateItems;
+  const rawTools = useMemo(() => items.flatMap((item) => item.kind === "tool" ? [item.message] : []), [items]);
+  const toolsRef = useRef(rawTools);
+  const tools = reuseReferences(toolsRef.current, rawTools);
+  toolsRef.current = tools;
+  const delegationItems = useMemo(() => tools.map((message) => ({ kind: "tool" as const, message })), [tools]);
   // One delegation reads the same as five: the card is how a delegation is
   // presented, not a treatment reserved for fan-out. A lone `Task` rendered as
   // an ordinary tool row hid the outcome, runtime and step count that the card
@@ -219,46 +244,36 @@ export const ActivityGroup = memo(function ActivityGroup({
   // tool is in a different activity part (the agent emitted text between Task
   // and TaskWait), the turn-level statuses computed by the parent give us the
   // cross-part view we need.
-  const delegationStatuses = turnDelegationStatuses ?? collectDelegationStatuses(items);
-  const delegationTimings =
-    turnDelegationTimings ?? collectDelegationTimings(items);
-  const subagentSummary = summarizeSubagentActivity(
+  const delegationStatuses = useMemo(() => turnDelegationStatuses ?? collectDelegationStatuses(delegationItems), [turnDelegationStatuses, delegationItems]);
+  const delegationTimings = useMemo(() => turnDelegationTimings ?? collectDelegationTimings(delegationItems), [turnDelegationTimings, delegationItems]);
+  const subagentSummary = useMemo(() => summarizeSubagentActivity(
     delegateItems,
     delegationStatuses,
-  );
+  ), [delegateItems, delegationStatuses]);
   // Parent tools after a Task fan-out live in a later activity part (D319), so
   // this card is not the turn's live tail while its delegates are still running.
   const topologyLive = hasSubagentTopology && subagentSummary.running > 0;
   const live = isActive || topologyLive;
   const searchTarget = useContext(TranscriptSearchContext);
-  const revealRequest = searchTarget && items.some((item) => item.message.id === searchTarget.messageId)
-    ? searchTarget.requestId : undefined;
-  const {
-    open,
-    toggle: toggleDisclosure,
-    collapse: collapseDisclosure,
-    claim: claimDisclosure,
-  } = useAutomaticDisclosure(live, revealRequest);
+  const revealRequest = useMemo(() => searchTarget && items.some((item) => item.message.id === searchTarget.messageId)
+    ? searchTarget.requestId : undefined, [items, searchTarget]);
+  const visibleItems = useMemo(() => cachedVisibleActivityItems(items, compact, isActive), [items, compact, isActive]);
+  const first = items[0];
+  const disclosure = useAutomaticDisclosure(
+    hasSubagentTopology ? live : visibleItems.length <= 1 || (!compact && live),
+    revealRequest,
+    disclosureKey("activity", first?.message.id ?? "", first?.kind ?? "", first?.kind === "hostedSearch" ? first.round.id : ""),
+  );
+  const { open, toggle: toggleDisclosure, collapse: collapseDisclosure, claim: claimDisclosure, titleRef } = disclosure;
   const [now, setNow] = useState(Date.now);
   const [finishedAt, setFinishedAt] = useState<number | null>(null);
   const wasActiveRef = useRef(live);
-  const messages = items.map((item) => item.message);
-  const topologyTiming = hasSubagentTopology
-    ? delegationTimingBounds(delegateItems, delegationTimings)
-    : null;
-  const startedAt =
-    topologyTiming?.startedAt ??
-    (Date.parse(messages[0]?.createdAt || "") || now);
-  const fallbackEnd =
-    Math.max(
-      startedAt,
-      ...messages.map(
-        (message) =>
-          Date.parse(message.toolCompletedAt || "") ||
-          (Date.parse(message.createdAt) || startedAt) +
-            (message.toolDurationMs || 0),
-      ),
-    );
+  const timingInputs = useMemo(() => activityTimingInputs(items), [items]);
+  const topologyTiming = useMemo(() => hasSubagentTopology
+    ? delegationTimingBounds(delegateItems, delegationTimings) : null,
+  [hasSubagentTopology, delegateItems, delegationTimings]);
+  const startedAt = topologyTiming?.startedAt ?? (timingInputs.startedAt || now);
+  const fallbackEnd = Math.max(startedAt, timingInputs.recordedEnd, startedAt + timingInputs.missingStartDuration);
   const completedAt =
     topologyTiming?.completedAt ??
     (Date.parse(endedAt || "") ||
@@ -274,7 +289,7 @@ export const ActivityGroup = memo(function ActivityGroup({
     isActive &&
     lastItem?.kind === "thinking" &&
     lastItem.message.status === "streaming";
-  const onlyThinking = items.every((item) => item.kind === "thinking");
+  const onlyThinking = useMemo(() => items.every((item) => item.kind === "thinking"), [items]);
   const label = hasSubagentTopology
     ? t(
         live
@@ -301,8 +316,10 @@ export const ActivityGroup = memo(function ActivityGroup({
   const runtimeStatus = runtimeActivity
     ? runActivityLabel(runtimeActivity, t as Translate)
     : "";
-  const currentDetail =
-    live && !runtimeStatus && lastItem ? activityItemDetail(lastItem) : "";
+  const currentDetail = useMemo(() =>
+    live && !runtimeStatus && lastItem && !(compact && lastItem.kind === "thinking")
+      ? activityItemDetail(lastItem) : "",
+  [live, runtimeStatus, lastItem, compact]);
   const tail = live && !open ? currentDetail : "";
 
   useEffect(() => {
@@ -314,42 +331,25 @@ export const ActivityGroup = memo(function ActivityGroup({
     return () => window.clearInterval(id);
   }, [live]);
 
-  const renderActivityItems = () => {
-    let renderedTopology = false;
-    return items.map((item, itemIndex) => {
-      if (hasSubagentTopology && isDelegationActivityItem(item)) {
-        if (renderedTopology) return null;
-        renderedTopology = true;
-        return (
-          <SubagentTopology
-            key="subagent-topology"
-            items={delegateItems}
-            delegationStatuses={delegationStatuses}
-            delegationTimings={delegationTimings}
-            onUserInteraction={claimDisclosure}
-          />
-        );
-      }
-      return item.kind === "tool" ? (
-        <Fragment key={item.message.id}>
-          <ToolRow
-            message={item.message}
-            onUserInteraction={claimDisclosure}
-            {...(item.delegate ? { delegate: item.delegate } : {})}
-          />
-          <ReviewChangeCard message={item.message} />
-        </Fragment>
-      ) : (
-        <ThinkingRow
-          key={`thinking-${item.message.id}`}
-          message={item.message}
-          streaming={isActive && item.message.status === "streaming"}
-          autoOpen={live && itemIndex === items.length - 1}
-          onUserInteraction={claimDisclosure}
-        />
-      );
-    });
-  };
+  const renderedItems = <ActivityItems
+    items={items}
+    compact={compact}
+    isLast={isLast}
+    isActive={isActive}
+    live={live}
+    delegateItems={delegateItems}
+    delegationStatuses={delegationStatuses}
+    delegationTimings={delegationTimings}
+    onUserInteraction={claimDisclosure}
+  />;
+
+  if (!hasSubagentTopology) {
+    return (
+      <ProcessActivityGroup items={visibleItems} active={isActive} disclosure={disclosure}>
+        {renderedItems}
+      </ProcessActivityGroup>
+    );
+  }
 
   return (
     <div
@@ -360,6 +360,7 @@ export const ActivityGroup = memo(function ActivityGroup({
       }`}
     >
       <button
+        ref={titleRef}
         className="tool-activity-header"
         aria-expanded={open}
         aria-controls={detailsId}
@@ -401,6 +402,8 @@ export const ActivityGroup = memo(function ActivityGroup({
         </div>
       ) : null}
       <div
+        ref={disclosure.bodyRef}
+        {...disclosure.bodyEvents}
         className="tool-activity-collapse"
         aria-hidden={!open}
         inert={!open}
@@ -408,10 +411,10 @@ export const ActivityGroup = memo(function ActivityGroup({
         <div className="tool-activity-collapse-inner">
           <div className="tool-activity-body" id={detailsId}>
             <DisclosureCollapseRail
-              label={t("chat.collapseDetails")}
+              label={t("chat.collapseActivityGroup")}
               onCollapse={collapseDisclosure}
             />
-            {renderActivityItems()}
+            <DisclosureScope disclosure={disclosure}>{renderedItems}</DisclosureScope>
           </div>
         </div>
       </div>
@@ -426,7 +429,7 @@ function formatLiveTokenCount(value: number): string {
   return String(value);
 }
 
-/** Compact tok/s chip for the run-activity / streaming status strip. */
+/** Compact tok/s chip for the run-activity / working status strip. */
 export function LiveTokenRateLabel({ rate }: { rate: LiveTokenRate }) {
   const { t } = useTranslation();
   if (rate.tokensPerSecond === undefined) return null;
@@ -447,7 +450,7 @@ export function LiveTokenRateLabel({ rate }: { rate: LiveTokenRate }) {
   );
 }
 
-/** Keep the transcript responsive while the model waits for its first event. */
+/** Keep the running turn visible when no more specific runtime phase is known. */
 export function WorkingIndicator({
   startedAt,
   tokenRate,
@@ -501,6 +504,8 @@ export function RunActivityIndicator({
   const { t } = useTranslation();
   const [now, setNow] = useState(Date.now);
   const retryErrorDetailsId = useId();
+  const retryReasonRef = useRef<HTMLSpanElement | null>(null);
+  const retryPlateRef = useRef<HTMLSpanElement | null>(null);
 
   useEffect(() => {
     setNow(Date.now());
@@ -513,6 +518,66 @@ export function RunActivityIndicator({
   );
   const label = runActivityLabel(activity, t as Translate, now);
   const retryError = activity.phase === "retrying" ? activity.error : undefined;
+
+  // The plate hangs off the tail row inside `.thread-scroll`, whose
+  // `overflow: auto` clips it, and the conversation bar paints over the same
+  // band from a higher stacking level. The room depends on where the row sits
+  // in the viewport, which no window-based rule can know: a short transcript
+  // leaves the row mid-window, and a long provider message still lost its first
+  // lines (ADR 0196). Measure the room the row actually leaves - the plate is
+  // anchored 8px above the trigger, so its own bottom edge starts that room -
+  // and let the remainder scroll.
+  useEffect(() => {
+    if (!retryError) return;
+    const reason = retryReasonRef.current;
+    const plate = retryPlateRef.current;
+    if (!reason || !plate) return;
+    const measure = () => {
+      const toolbarHeight =
+        Number.parseFloat(
+          getComputedStyle(reason).getPropertyValue("--ds-toolbar-height"),
+        ) || 0;
+      // The plate is anchored 8px above the trigger, so its own bottom edge
+      // starts the room - but the resting state carries a 4px downward
+      // translate the revealed state drops. Measure the settled edge, or the
+      // cap comes out 4px too generous and the top slides under the bar.
+      const resting = getComputedStyle(plate).transform;
+      const offset = resting === "none" ? 0 : new DOMMatrixReadOnly(resting).m42;
+      const settledBottom = plate.getBoundingClientRect().bottom - offset;
+      const room = Math.floor(settledBottom - toolbarHeight);
+      // The heading stays readable: only the message body scrolls inside the
+      // plate, which keeps the plate's own rounded corner away from a
+      // scrollbar (Chromium does not clip one to the radius).
+      const bodyText = plate.querySelector<HTMLElement>(
+        ".run-activity-error-message",
+      );
+      const chrome = bodyText
+        ? bodyText.getBoundingClientRect().top -
+          plate.getBoundingClientRect().top +
+          (Number.parseFloat(getComputedStyle(plate).paddingBottom) || 0)
+        : 0;
+      plate.style.setProperty(
+        "--run-activity-error-max-height",
+        `${Math.max(0, room)}px`,
+      );
+      plate.style.setProperty(
+        "--run-activity-error-body-max-height",
+        `${Math.max(0, Math.floor(room - chrome))}px`,
+      );
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    const scroller = reason.closest(".thread-scroll");
+    scroller?.addEventListener("scroll", measure, { passive: true });
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    observer?.observe(document.documentElement);
+    return () => {
+      window.removeEventListener("resize", measure);
+      scroller?.removeEventListener("scroll", measure);
+      observer?.disconnect();
+    };
+  }, [retryError]);
   const retryErrorSummary = retryError
     ? (() => {
         const key = `errors.${retryError.code}`;
@@ -525,6 +590,7 @@ export function RunActivityIndicator({
     : label;
   const labelContent = retryError ? (
     <span
+      ref={retryReasonRef}
       className="run-activity-retry-reason"
       tabIndex={0}
       aria-describedby={retryErrorDetailsId}
@@ -533,6 +599,7 @@ export function RunActivityIndicator({
       <span className="working-indicator-label">{label}</span>
       <span
         id={retryErrorDetailsId}
+        ref={retryPlateRef}
         className="run-activity-error-popover message-error"
         role="tooltip"
       >
@@ -544,6 +611,11 @@ export function RunActivityIndicator({
             <strong>{retryErrorSummary}</strong>
             <code>
               {retryError.code}
+              {/* The transport errno names the failing layer (ENOTFOUND, a
+                  TLS code, a dropped socket) while the localized summary
+                  cannot; it is a technical token in the same style as the
+                  code beside it, so it needs no translation (issue #234). */}
+              {retryError.networkCode ? ` · ${retryError.networkCode}` : ""}
               {retryError.providerStatus !== undefined
                 ? ` · HTTP ${retryError.providerStatus}`
                 : ""}
@@ -579,24 +651,6 @@ export function RunActivityIndicator({
       <span className="working-elapsed" aria-hidden="true">
         {elapsed}
       </span>
-    </div>
-  );
-}
-
-/** Rate-only strip while answer tokens are streaming (activity rows stay hidden). */
-export function StreamingTokenRateIndicator({
-  tokenRate,
-}: {
-  tokenRate: LiveTokenRate;
-}) {
-  if (tokenRate.tokensPerSecond === undefined) return null;
-  return (
-    <div
-      className="working-indicator streaming-rate-indicator"
-      data-testid="streaming-rate-indicator"
-      aria-hidden="true"
-    >
-      <LiveTokenRateLabel rate={tokenRate} />
     </div>
   );
 }

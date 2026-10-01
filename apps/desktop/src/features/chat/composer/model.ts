@@ -3,13 +3,17 @@ import type {
   Mode,
   PermissionMode,
   ProviderPublic,
+  SessionThinkingLevel,
   ThinkingLevel,
 } from "@pi-desktop/shared";
 import {
-  modelIdsMatch,
+  isSessionThinkingLevel,
   PERMISSION_MODES,
+  sessionThinkingMenuLevels,
 } from "@pi-desktop/shared";
-import { providerThinkingLevels } from "../../../lib/session-thinking";
+import { sameComposerModelId } from "../../../lib/composer-models.ts";
+import type { ComposerPluginPart } from "../../../lib/composer-smart-stop";
+import { providerThinkingLevels } from "../../../lib/session-thinking.ts";
 
 export const COMPOSER_MIN_HEIGHT_PX = 28;
 export const COMPOSER_MAX_VISIBLE_ROWS = 7;
@@ -35,12 +39,7 @@ export const MODE_LABEL_KEYS: Record<Mode, string> = {
   goal: "settings.modeGoal",
 };
 
-export const PERMISSION_MODE_I18N_KEYS: Record<PermissionMode, string> = {
-  inherit: "chat.permissionInherit",
-  ask: "chat.permissionAsk",
-  "accept-edits": "chat.permissionAcceptEdits",
-  auto: "chat.permissionAuto",
-};
+export { PERMISSION_MODE_I18N_KEYS } from "../../../lib/permission-mode-labels.ts";
 
 export const THINKING_LEVELS: readonly ThinkingLevel[] = [
   "off",
@@ -65,9 +64,10 @@ export type ComposerFileReference = {
   kind: "image" | "file";
   mimeType?: string;
   token?: string;
+  plugin?: ComposerPluginPart;
 };
 
-export type ComposerMenuView = "root" | "model" | "thinking";
+export type ComposerMenuView = "root" | "model";
 
 export type PromptEnhancementError = {
   message: string;
@@ -79,8 +79,8 @@ export function nextMode(mode: Mode): Mode {
   return MODE_CYCLE[(index + 1) % MODE_CYCLE.length] ?? "agent";
 }
 
-export function isThinkingLevel(value: unknown): value is ThinkingLevel {
-  return typeof value === "string" && THINKING_LEVELS.includes(value as ThinkingLevel);
+export function isThinkingLevel(value: unknown): value is SessionThinkingLevel {
+  return isSessionThinkingLevel(value);
 }
 
 export function isPermissionMode(value: unknown): value is PermissionMode {
@@ -96,10 +96,11 @@ export function isPermissionMode(value: unknown): value is PermissionMode {
  */
 export function thinkingLevelForProvider(
   provider: ProviderPublic | null | undefined,
-  current: ThinkingLevel,
-): ThinkingLevel {
+  current: SessionThinkingLevel,
+): SessionThinkingLevel {
   const available = providerThinkingLevels(provider);
   if (!provider?.supportsReasoning) return "off";
+  if (current === "omit") return "omit";
   if (available.includes(current)) return current;
   const requestedIndex = THINKING_LEVELS.indexOf(current);
   for (let index = requestedIndex; index < THINKING_LEVELS.length; index += 1) {
@@ -127,15 +128,32 @@ export function thinkingProviderForModel(
   modelCatalog: readonly ModelInfo[] | undefined,
 ): ProviderPublic | null | undefined {
   if (!provider || !modelId) return provider;
-  const model = modelCatalog?.find((candidate) => modelIdsMatch(candidate.modelId, modelId));
-  if (!model) return provider;
+  const model = modelCatalog?.find((candidate) => sameComposerModelId(candidate.modelId, modelId));
 
   const binding = provider.models.find((candidate) =>
-    modelIdsMatch(candidate.id, model.modelId),
+    sameComposerModelId(candidate.id, modelId),
   );
   const configuredLevels = binding
     ? THINKING_LEVELS.filter((level) => binding.thinkingLevels.includes(level))
     : undefined;
+
+  if (model?.catalogSource !== "models.dev") {
+    // Discovery/user rows are not trusted capability matches.
+    // A binding override still takes precedence when present.
+    // An empty binding is the generic seed for an unknown model, not an
+    // explicit disable; `off` is the persisted opt-out for that case.
+    const unmatchedLevels = configuredLevels?.length ? configuredLevels : undefined;
+    const supportsReasoning = unmatchedLevels
+      ? unmatchedLevels.some((level) => level !== "off")
+      : true;
+    return {
+      ...provider,
+      supportsReasoning,
+      supportedThinkingLevels:
+        unmatchedLevels ?? [...THINKING_LEVELS],
+    };
+  }
+
   const supportsReasoning = configuredLevels
     ? configuredLevels.some((level) => level !== "off")
     : model.reasoning === true || model.capabilities.includes("reasoning");
@@ -151,3 +169,5 @@ export function cssPixels(value: string): number {
   const parsed = Number.parseFloat(value);
   return Number.isFinite(parsed) ? parsed : 0;
 }
+
+export { sessionThinkingMenuLevels };

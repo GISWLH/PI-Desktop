@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const sidecarSource = await readFile(
-  new URL("../electron/main/agent-sidecar.ts", import.meta.url),
+  new URL("../../../packages/host-runtime/src/agent-sidecar.ts", import.meta.url),
   "utf8",
 );
 const runtimeSidecarSource = await readFile(
@@ -12,7 +12,7 @@ const runtimeSidecarSource = await readFile(
   "utf8",
 );
 const hostSource = await readFile(
-  new URL("../electron/main/host-process.ts", import.meta.url),
+  new URL("../../../packages/host-runtime/src/host-process.ts", import.meta.url),
   "utf8",
 );
 const mainSource = await readMainSource();
@@ -27,10 +27,49 @@ const rpcTimeoutSource = await readFile(
   new URL("../../../packages/shared/src/rpc-timeouts.ts", import.meta.url),
   "utf8",
 );
+const agentSidecarEntrySource = await readFile(
+  new URL("../../../packages/agent-runtime/src/sidecar.ts", import.meta.url),
+  "utf8",
+);
+const e2eHostSource = await readFile(
+  new URL("../../../scripts/e2e/host.mjs", import.meta.url),
+  "utf8",
+);
+const e2eSmokeSource = await readFile(
+  new URL("../../../scripts/e2e-smoke.mjs", import.meta.url),
+  "utf8",
+);
+const codexImporterSource = await readFile(
+  new URL("../electron/main/importers/codex.ts", import.meta.url),
+  "utf8",
+);
 const apiSource = await readFile(
   new URL("../src/lib/api.ts", import.meta.url),
   "utf8",
 );
+
+test("stdio RPC readers split frames on LF only", () => {
+  for (const [name, source] of [
+    ["host-process", hostSource],
+    ["agent-sidecar", sidecarSource],
+    ["runtime sidecar", agentSidecarEntrySource],
+    ["e2e host harness", e2eHostSource],
+    ["e2e smoke host", e2eSmokeSource],
+    ["codex importer", codexImporterSource],
+  ]) {
+    assert.match(source, /readNdjsonLines/, `${name} must use LF NDJSON framing`);
+    assert.doesNotMatch(
+      source,
+      /from ["']node:readline["']/,
+      `${name} must not use readline`,
+    );
+    assert.doesNotMatch(
+      source,
+      /createInterface/,
+      `${name} must not call createInterface`,
+    );
+  }
+});
 
 test("sidecar detaches host listeners and gates every child write", () => {
   assert.match(sidecarSource, /private closeTransport\(error: Error\)/);
@@ -115,13 +154,12 @@ test("host disposal closes stdin, observes exit, and force-kills only after grac
   );
 });
 
-test("Bash defaults are finite and the tool advertises the effective timeout", () => {
+test("Bash execution remains bounded while permission transport has no deadline", () => {
   assert.match(runtimeSource, /DEFAULT_COMMAND_TIMEOUT_MS/);
   assert.match(runtimeSource, /defaults to a 60-second timeout/);
   assert.match(runtimeSource, /timeoutMs,\n\s+}/);
-  assert.match(rpcTimeoutSource, /DEFAULT_BASH_RPC_TIMEOUT_MS/);
-  assert.match(rpcTimeoutSource, /return DEFAULT_BASH_RPC_TIMEOUT_MS/);
-  assert.doesNotMatch(rpcTimeoutSource, /return undefined/);
+  assert.doesNotMatch(rpcTimeoutSource, /DEFAULT_BASH_RPC_TIMEOUT_MS/);
+  assert.match(rpcTimeoutSource, /if \(method === "tools\.execute"\) return undefined/);
 });
 
 test("turn ownership and execution queue wake only after durable turn settlement", () => {
@@ -180,15 +218,25 @@ test("app quit waits for one idempotent teardown before allowing the follow-up q
       shutdownSource.indexOf("if (state.shutdownPromise) return"),
     "the first quit must be prevented before the idempotence guard returns",
   );
+  // Panel windows and docked views are the only pages that call the host and the
+  // plugin runtime over the panel bridge. Their pages are gone before either
+  // stops: a call a page already sent while its surface was closing is otherwise
+  // answered by a runtime that is already shutting down, and is reported as a
+  // bridge failure nobody can act on.
   assert.ok(
-    shutdownSource.indexOf("getHost()?.dispose()") <
-      shutdownSource.indexOf("pluginPanels.closeAll()"),
-    "host disposal must start before other application teardown",
+    shutdownSource.indexOf("await pluginSurfacesShutdown") <
+      shutdownSource.indexOf("getHost()?.dispose()"),
+    "panel and view pages must be gone before the host stops",
+  );
+  assert.ok(
+    shutdownSource.indexOf("await pluginSurfacesShutdown") <
+      shutdownSource.indexOf("plugins.disposeAll()"),
+    "no panel page may still call a plugin runtime that is stopping",
   );
   assert.match(shutdownSource, /await hostShutdown/);
   assert.match(
     shutdownSource,
-    /await Promise\.allSettled\(\[\s*pluginPanelShutdown,\s*pluginShutdown,\s*sidecarShutdown,\s*mcpShutdown,\s*\]\)/,
+    /await Promise\.allSettled\(\[\s*pluginShutdown,\s*sidecarShutdown,\s*mcpShutdown,\s*remoteHostsShutdown,\s*\]\)/,
   );
   const releaseQuit = shutdownSource.match(
     /const releaseQuit = \(\) => \{[\s\S]*?shutdownComplete = true;[\s\S]*?app\.quit\(\);[\s\S]*?\};/,
@@ -202,7 +250,7 @@ test("app quit waits for one idempotent teardown before allowing the follow-up q
 
 test("settings writes validate without applying read defaults", () => {
   assert.match(mainSource, /validateSettingsWrite\(settings\)/);
-  assert.match(mainSource, /host\.call\("settings\.set", validatedSettings\)/);
+  assert.match(mainSource, /host\.call(?:<AppSettings>)?\("settings\.set", validatedSettings\)/);
   assert.doesNotMatch(mainSource, /host\.call\("settings\.set", normalizedSettings\)/);
   assert.match(apiSource, /export function validateSettingsWrite/);
   assert.match(apiSource, /invoke\(IPC\.invoke\.settingsSet, validateSettingsWrite\(settings\)\)/);
@@ -248,7 +296,23 @@ test("sidecar crash reports carry the last stderr lines", () => {
   );
   assert.match(mainSource, /agent sidecar exited unexpectedly/);
   assert.ok(
-    mainSource.includes("data: { exitCode: code, signal, stderrTail }"),
+    mainSource.includes("stderrTail,"),
     "crash log carries the tail",
+  );
+  // The crash kind is classified once from the tail and reaches both the
+  // settlement code and the log line, so an OOM death never reads as an
+  assert.match(runtimeSidecarSource, /classifySidecarCrash\(stderrTail\)/);
+  assert.match(runtimeSidecarSource, /sidecarCrashErrorCode\(crash\.kind\)/);
+  assert.match(runtimeSidecarSource, /crashKind: crash\.kind/);
+  assert.ok(
+    runtimeSidecarSource.includes(
+      "settleCrashedSession(sessionId, crashedTurnId, crashErrorCode)",
+    ),
+    "the owning turn settles with the classified code",
+  );
+  assert.doesNotMatch(runtimeSidecarSource, /finishTurn\([^)]*"PLAN_APPROVAL_INTERRUPTED"/);
+  assert.match(
+    runtimeSidecarSource,
+    /finishTurn\(sessionId, "aborted", errorCode, \{/,
   );
 });

@@ -1,4 +1,7 @@
-import { app, BrowserWindow, Menu, nativeImage, nativeTheme, Tray } from "electron";
+import {
+  app, BrowserWindow, Menu, nativeImage, nativeTheme, powerSaveBlocker, Tray,
+  type MenuItemConstructorOptions,
+} from "electron";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -6,6 +9,8 @@ import {
   APP_NAME,
   IPC,
   isThemeColorScheme,
+  traySessionTitle,
+  migrateKeybindingOverrides,
   type AppMenuCommand,
   type CloseBehavior,
   type KeybindingOverrides,
@@ -13,11 +18,17 @@ import {
 } from "@pi-desktop/shared";
 import { catalogs, resolveLocale } from "@pi-desktop/i18n";
 import { installApplicationMenu } from "../application-menu";
+import { createTraySessions } from "../tray-sessions";
+import { createTaskbarUnreadBadge } from "../taskbar-unread-badge";
 import { createWindow, type WindowLifecycleState } from "./window";
-import type { BrowserPane } from "../browser-view";
+import { windowToggleAction } from "./window-visibility";
+import type { BrowserHost } from "../browser-host";
 import type { Logger } from "../logger";
 import type { PluginRuntime } from "../plugin-runtime";
 import type { PluginViewHost } from "../plugin-view-host";
+import type { HostProcess } from "../host-process";
+import { syncPluginDisplayLocale } from "../plugin-display-locale";
+import { createPowerSaveBlockerController } from "../keep-awake";
 import type { PluginAppearance } from "../../shared/plugin-panel-chrome";
 
 export type ApplicationLifecycleState = {
@@ -55,15 +66,16 @@ export type ApplicationLifecycleDependencies = {
   showPluginLauncher: () => Promise<void>;
   askCloseBehavior: (window: BrowserWindow) => Promise<CloseBehavior | null>;
   applyCloseBehavior: (behavior: CloseBehavior) => void;
-  browserPane: BrowserPane;
+  browserHost: BrowserHost;
   pluginViews: PluginViewHost;
-  pluginSettingsViews: PluginViewHost;
   plugins: PluginRuntime;
   logger: Pick<Logger, "app">;
   refreshReleaseNotes: () => void;
   applyPluginLauncherShortcut: (keybindings?: KeybindingOverrides) => void;
-  applySummonWindowShortcut: (keybindings?: KeybindingOverrides) => void;
+  applyToggleWindowShortcut: (keybindings?: KeybindingOverrides) => void;
   broadcastPluginPanelEvent: (event: string, payload: unknown) => void;
+  getHost: () => HostProcess | null;
+  getRunningSessionIds: () => Iterable<string>;
 };
 
 export function createApplicationLifecycle({
@@ -87,16 +99,31 @@ export function createApplicationLifecycle({
   showPluginLauncher,
   askCloseBehavior,
   applyCloseBehavior,
-  browserPane,
+  browserHost,
   pluginViews,
-  pluginSettingsViews,
   plugins,
   logger,
   refreshReleaseNotes,
   applyPluginLauncherShortcut,
-  applySummonWindowShortcut,
+  applyToggleWindowShortcut,
   broadcastPluginPanelEvent,
+  getHost,
+  getRunningSessionIds,
 }: ApplicationLifecycleDependencies) {
+  const traySessions = createTraySessions({
+    getHost,
+    getRunningSessionIds,
+    isQuitting: () => state.quitting,
+    onChanged: () => updateTrayMenu(),
+    logger,
+  });
+  const taskbarUnreadBadge = createTaskbarUnreadBadge({
+    getHost,
+    getMainWindow: () => state.mainWindow,
+    isQuitting: () => state.quitting,
+    logger,
+  });
+  let trayActivationGeneration = 0;
 
   function applyDevelopmentBranding() {
     if (process.platform !== "darwin" || !isDevelopmentBuild || !app.dock) return;
@@ -149,12 +176,71 @@ export function createApplicationLifecycle({
       });
   }
 
-  function updateTrayMenu(locale = app.getLocale()) {
+  async function activateTraySession(sessionId: string | null) {
+    const generation = ++trayActivationGeneration;
+    await ensureWindow();
+    const window = state.mainWindow;
+    if (!window || window.isDestroyed() || !(await waitForMenuRenderer(window))) return;
+    if (generation !== trayActivationGeneration) return;
+    if (window.isMinimized()) window.restore();
+    window.show();
+    window.focus();
+    if (sessionId) await traySessions.refresh();
+    if (
+      generation !== trayActivationGeneration ||
+      window !== state.mainWindow ||
+      window.isDestroyed()
+    ) return;
+    if (sessionId && !traySessions.canActivate(sessionId)) return;
+    sendToRenderer(IPC.event.traySessionActivated, { sessionId });
+  }
+
+  function dispatchTrayActivation(sessionId: string | null) {
+    void activateTraySession(sessionId).catch((error) => {
+      logger.app("diagnostics", "error", "tray session activation failed", {
+        data: String(error),
+      });
+    });
+  }
+
+  /**
+   * One press of the merged window shortcut (D438): hide the window the user is
+   * looking at, otherwise bring it back. Hiding is `Window.hide()` and never
+   * the close path, so it raises no close-behaviour prompt, destroys no window,
+   * and quits nothing — the tray (or the same key again) is the way back.
+   */
+  function toggleMainWindow() {
+    const window = state.mainWindow;
+    if (window && !window.isDestroyed() && windowToggleAction(window) === "hide") {
+      window.hide();
+      return;
+    }
+    restoreMainWindow();
+  }
+
+  function updateTrayMenu(locale = appearanceState.updaterLocale || app.getLocale()) {
     if (!state.tray) return;
-  const labels = catalogs[resolveLocale(locale)].tray;
+    const catalog = catalogs[resolveLocale(locale)];
+    const labels = catalog.tray;
+    const template: MenuItemConstructorOptions[] = [
+      { label: labels.open, click: restoreMainWindow },
+    ];
+    for (const group of traySessions.getGroups()) {
+      template.push({ type: "separator" }, { label: labels[group.kind], enabled: false });
+      for (const session of group.sessions) {
+        const title = traySessionTitle(session.title, catalog.chat.untitledTask);
+        template.push({
+          label: process.platform === "darwin" ? title : title.replace(/&/g, "&&"),
+          click: () => dispatchTrayActivation(session.id),
+        });
+      }
+      if (group.hasMore) {
+        template.push({ label: labels.viewMore, click: () => dispatchTrayActivation(null) });
+      }
+    }
     state.tray.setContextMenu(
       Menu.buildFromTemplate([
-        { label: labels.open, click: restoreMainWindow },
+        ...template,
         { type: "separator" },
         { label: labels.quit, click: () => app.quit() },
       ]),
@@ -186,9 +272,20 @@ export function createApplicationLifecycle({
 
     state.tray = new Tray(icon);
     state.tray.setToolTip(APP_NAME);
-    state.tray.on("click", restoreMainWindow);
+    // macOS single-click opens its attached menu without focusing/reading a conversation.
+    // mouse-enter/move/leave replace the native NSStatusItem with a custom view,
+    // which hides the menu-bar extra. Keep hover retry on Windows/Linux only.
+    if (process.platform !== "darwin") {
+      state.tray.on("click", restoreMainWindow);
+      state.tray.on("mouse-enter", () => { void traySessions.refresh(); });
+      state.tray.on("right-click", () => { void traySessions.refresh(); });
+    }
     state.tray.on("double-click", restoreMainWindow);
     updateTrayMenu();
+    void traySessions.refresh();
+    void taskbarUnreadBadge.refresh();
+    // Window is live here; force-paint any count learned before the BrowserWindow existed.
+    taskbarUnreadBadge.replay();
   }
 
 
@@ -243,17 +340,13 @@ export function createApplicationLifecycle({
       observedWorkPanelBaseBounds,
       classifyDisplayTransition,
       resetMenuRendererReady,
-      markMenuRendererReady,
-      sendToRenderer,
       safeOpenExternal,
       showPluginLauncher,
       askCloseBehavior,
       applyCloseBehavior,
       createTray,
-      browserPane,
+      browserHost,
       pluginViews,
-      pluginSettingsViews,
-      plugins,
       logger,
     });
   }
@@ -303,8 +396,9 @@ export function createApplicationLifecycle({
     action: NativeMenuAction,
     target: BrowserWindow | null = state.mainWindow,
   ) {
-    if (action === "restoreMainWindow") {
-      restoreMainWindow();
+    if (action === "restoreMainWindow" || action === "toggleMainWindow") {
+      if (action === "restoreMainWindow") restoreMainWindow();
+      else toggleMainWindow();
       const window = state.mainWindow;
       return {
         maximized: Boolean(window && !window.isDestroyed() && window.isMaximized()),
@@ -385,6 +479,35 @@ export function createApplicationLifecycle({
     }
   }
 
+  const powerError = (kind: string, operation: string, error: unknown) => {
+    logger.app("lifecycle", "warn", `power blocker ${kind} ${operation} failed`, {
+      data: String(error),
+    });
+  };
+  const displayBlocker = createPowerSaveBlockerController(
+    powerSaveBlocker,
+    "prevent-display-sleep",
+    (operation, error) => powerError("display", operation, error),
+  );
+  const systemBlocker = createPowerSaveBlockerController(
+    powerSaveBlocker,
+    "prevent-app-suspension",
+    (operation, error) => powerError("system", operation, error),
+  );
+
+  function applyPreventScreenSleep(settings?: { preventScreenSleep?: unknown } | null) {
+    displayBlocker.setEnabled(settings?.preventScreenSleep === true);
+  }
+
+  function applyKeepAwakeWhileRunning(settings?: { keepAwakeWhileRunning?: unknown } | null) {
+    systemBlocker.setEnabled(settings?.keepAwakeWhileRunning === true);
+  }
+
+  function disposePowerSaveBlockers() {
+    displayBlocker.dispose();
+    systemBlocker.dispose();
+  }
+
   /**
    * Drive Chromium and macOS native chrome (menus, vibrancy) from the same
    * theme preference the renderer paints. `system` keeps following the OS;
@@ -414,7 +537,7 @@ export function createApplicationLifecycle({
   /**
    * Apply only the `AppSettings.theme` preference to the host's appearance
    * state. Reused by `applyApplicationMenuSettings` so the full-settings path
-   * and the narrow plugin `app.setTheme` path (ADR 0249) agree.
+   * and the narrow plugin `app.setTheme` path (ADR 0260) agree.
    *
    * Deliberately narrower than `applyApplicationMenuSettings`: theme changes
    * never touch the locale, keybindings, or developer-mode menu state, so a
@@ -457,14 +580,27 @@ export function createApplicationLifecycle({
     if (locale !== appearanceState.updaterLocale) {
       appearanceState.updaterLocale = locale;
       refreshReleaseNotes();
+      // Plugin labels are resolved in the host (a plugin ships them per
+      // locale), so the change is pushed there before the surfaces re-read.
+      // `pluginChanged` is also what makes the Extensions page re-list, so a
+      // language switch localizes the rows without a restart (ADR 0160).
+      void syncPluginDisplayLocale(getHost(), locale)
+        .then(() => sendToRenderer(IPC.event.pluginChanged, { reason: "locale" }))
+        // Notifying is best-effort: a window that is already gone must not turn
+        // a language change into an unhandled rejection.
+        .catch(() => {});
     }
     applyAppThemePreference(settings?.theme);
-    const keybindings =
+    // Persisted keybindings can still carry the retired window ids (D438); the
+    // main process is the only reader when the window never opens, so it folds
+    // them itself instead of relying on a renderer write-back.
+    const keybindings = migrateKeybindingOverrides(
       settings?.keybindings && typeof settings.keybindings === "object"
         ? (settings.keybindings as KeybindingOverrides)
-        : undefined;
+        : undefined,
+    );
     applyPluginLauncherShortcut(keybindings);
-    applySummonWindowShortcut(keybindings);
+    applyToggleWindowShortcut(keybindings);
     const devMode = settings?.developerMode === true;
     const signature = JSON.stringify({ locale, keybindings, devMode });
     if (appState.appliedMenuSettings === signature) return;
@@ -503,13 +639,18 @@ export function createApplicationLifecycle({
     return { theme: appearanceState.appThemePreference, base, locale: appearanceState.updaterLocale, pluginTheme };
   }
 
-  /** Push the current appearance to every open plugin panel, when it changed. */
+  /**
+   * Push the current appearance to every open plugin panel and every loaded
+   * plugin process, when it changed. Plugin-owned UI localizes from this
+   * payload (ADR 0280).
+   */
   function broadcastAppearance(): void {
     const appearance = resolveAppearance();
     const signature = JSON.stringify(appearance);
     if (signature === appearanceState.broadcastAppearanceSignature) return;
     appearanceState.broadcastAppearanceSignature = signature;
     broadcastPluginPanelEvent("appearance:changed", appearance);
+    plugins.broadcastEvent("appearance:changed", [appearance]);
   }
 
   function flushPendingApplicationMenuCommands() {
@@ -526,9 +667,12 @@ export function createApplicationLifecycle({
   }
 
   return {
+    traySessions,
+    taskbarUnreadBadge,
     applyDevelopmentBranding,
     hasVisibleWindow,
     restoreMainWindow,
+    toggleMainWindow,
     updateTrayMenu,
     createTray,
     resetMenuRendererReady,
@@ -541,6 +685,9 @@ export function createApplicationLifecycle({
     executeNativeMenuAction,
     dispatchNativeMenuAction,
     applyDeveloperMode,
+    applyPreventScreenSleep,
+    applyKeepAwakeWhileRunning,
+    disposePowerSaveBlockers,
     applyNativeThemeSource,
     applyAppThemePreference,
     applyApplicationMenuSettings,

@@ -29,12 +29,24 @@ export function copyProviderConfiguration(provider: ProviderPublic, name: string
       id: model.id,
       ...(model.alias !== undefined ? { alias: model.alias } : {}),
       contextWindow: model.contextWindow,
+      // Provenance travels with the value, so a copied catalog window keeps
+      // following models.dev and a copied override stays the user's.
+      ...(model.contextWindowSource !== undefined
+        ? { contextWindowSource: model.contextWindowSource }
+        : {}),
       maxTokens: model.maxTokens,
+      ...(model.maxTokensSource !== undefined
+        ? { maxTokensSource: model.maxTokensSource }
+        : {}),
       thinkingLevels: [...model.thinkingLevels],
       defaultThinkingLevel: model.defaultThinkingLevel,
+      ...(model.thinkingProtocol !== undefined
+        ? { thinkingProtocol: model.thinkingProtocol }
+        : {}),
       ...(model.supportsImages !== undefined ? { supportsImages: model.supportsImages } : {}),
       ...(model.supportsDocuments !== undefined ? { supportsDocuments: model.supportsDocuments } : {}),
       ...(model.availableForSubagents !== undefined ? { availableForSubagents: model.availableForSubagents } : {}),
+      ...(model.nativeWebSearch !== undefined ? { nativeWebSearch: model.nativeWebSearch } : {}),
     })),
   };
 }

@@ -2,14 +2,17 @@ mod activation;
 mod agent_capabilities;
 mod artifacts;
 mod audit;
+mod config_sync;
 mod db;
 mod keyboard;
 mod mcp_servers;
+mod network_policy;
 mod network_proxy;
 mod notifications;
 mod permissions;
 mod plans;
 mod plugin_sessions;
+mod plugin_usage;
 mod plugins;
 mod providers;
 mod review;
@@ -21,6 +24,7 @@ mod session_collaboration;
 mod session_search;
 mod sessions;
 mod state;
+mod todos;
 mod tool_budget;
 mod tools;
 mod transcripts;
@@ -34,6 +38,9 @@ use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
 use crate::state::AppState;
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

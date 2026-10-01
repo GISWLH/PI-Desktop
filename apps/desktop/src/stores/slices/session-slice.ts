@@ -1,7 +1,7 @@
 import i18n from "i18next";
-import { prepareTranscriptAction } from "../runtime/transcript-action";
 import type {
   Mode,
+  PendingInteractiveRequests,
   PlanProposal,
   ProposalKind,
   SessionDetail,
@@ -19,10 +19,13 @@ import {
   sessionIsReusableEmpty,
 } from "../../lib/session-create";
 import {
+  pinnedSessionModelBinding,
+  sessionNeedsModelPin,
+} from "../../lib/session-model";
+import {
   retainSessionPane,
 } from "../../lib/session-panes";
 import {
-  normalizeProjectPath,
   projectPathsForNewSessions,
   sessionMatchesProject,
 } from "../../lib/sidebar-session-groups";
@@ -31,6 +34,8 @@ import {
   sessionIsPinned,
   type SessionMeta,
 } from "../../lib/sidebar-preferences";
+import { enqueueAsk } from "../../lib/pending-asks";
+import { enqueuePermission } from "../../lib/pending-permissions";
 import { api } from "../../lib/api";
 import { createRefreshCoordinator } from "../../lib/refresh-coordinator";
 import {
@@ -40,15 +45,13 @@ import {
   durableCoversLiveSessionMessages,
   mergeLiveSessionMessages,
 } from "../../lib/session-transcript";
+import { sessionReadLooksEmpty } from "../../lib/session-transcript-read";
 import type {
   AppState,
   DraftSessionConfiguration,
-  NavigationOptions,
-  PendingPlanRefreshResult,
   SessionHistoryWindow,
 } from "../app-state";
 import {
-  type SessionConfiguration,
   type SessionRuntime,
 } from "../runtime/session-runtime";
 import type { StoreAccess } from "./types";
@@ -68,6 +71,7 @@ export type SessionSliceDependencies = StoreAccess & {
   openPlanArtifact: (
     proposal: PlanProposal,
     openWorkPanelTabForSession: AppState["openWorkPanelTabForSession"],
+    pluginViews: AppState["pluginViews"],
   ) => void;
   rememberSessionCompactions: (
     sessionId: string,
@@ -104,6 +108,7 @@ export function createSessionSlice({
 }: SessionSliceDependencies): Pick<
   AppState,
   | "refreshSessions"
+  | "restorePendingInteractive"
   | "restorePendingPlan"
   | "refreshPlanCheckpoints"
   | "prefetchSession"
@@ -112,6 +117,7 @@ export function createSessionSlice({
   | "forkSession"
   | "forkAssistantMessage"
   | "configureActiveSession"
+  | "abortSession"
 > {
   const refreshSessionList = createRefreshCoordinator(async () => {
     const result = await api.listSessions();
@@ -195,7 +201,11 @@ export function createSessionSlice({
           ),
         }));
         if (checkpoint && activeProposal) {
-          openPlanArtifact(checkpoint, get().openWorkPanelTabForSession);
+          openPlanArtifact(
+            checkpoint,
+            get().openWorkPanelTabForSession,
+            get().pluginViews,
+          );
         }
         return activeProposal ? "pending" : "terminal";
       } catch {
@@ -203,10 +213,63 @@ export function createSessionSlice({
       }
     },
 
+    /**
+     * Rebuild a session's decision cards from the Host-owned read.
+     *
+     * `pendingAsks` / `pendingPermissions` live in renderer memory only, so a
+     * renderer reload forgets both. Main still holds the open questions and
+     * gated tool requests, and this merges that read back in. It is a merge,
+     * never a replace: an entry the live event stream already delivered (or
+     * delivered while this read was in flight) stays exactly once, and nothing
+     * is ever cleared from here — an empty or failed read must not wipe cards
+     * the user can still answer.
+     *
+     * Only this desktop's own sessions have that read. `native-pi:` sessions
+     * are read-mostly imports and remote sessions are driven over RACP-WS, so
+     * both keep their own transports.
+     */
+    restorePendingInteractive: async (sessionId) => {
+      if (!sessionId || sessionId.startsWith("native-pi:")) return;
+      const session = get().sessions.find(
+        (candidate) => candidate.id === sessionId,
+      );
+      if (!session) return;
+      if (session.source === "pi-native" || session.source === "remote") return;
+      let pending: PendingInteractiveRequests;
+      try {
+        pending = await api.pendingInteractive(sessionId);
+      } catch {
+        // Silent and non-destructive: an unavailable Main leaves the queues
+        // exactly as the live stream left them.
+        return;
+      }
+      if (pending.asks.length === 0 && pending.permissions.length === 0) return;
+      set((state) => {
+        let pendingAsks = state.pendingAsks;
+        for (const ask of pending.asks) pendingAsks = enqueueAsk(pendingAsks, ask);
+        let pendingPermissions = state.pendingPermissions;
+        for (const permission of pending.permissions) {
+          pendingPermissions = enqueuePermission(pendingPermissions, permission);
+        }
+        if (
+          pendingAsks === state.pendingAsks &&
+          pendingPermissions === state.pendingPermissions
+        ) {
+          return {};
+        }
+        return { pendingAsks, pendingPermissions };
+      });
+    },
+
     refreshPlanCheckpoints: async () => {
       const sessionIds = get().sessions.map((session) => session.id);
       await Promise.allSettled(
-        sessionIds.map((sessionId) => get().restorePendingPlan(sessionId)),
+        sessionIds.map(async (sessionId) => {
+          await get().restorePendingPlan(sessionId);
+          // A sidecar restart or reload is when a forgotten card has to come
+          // back, so both reads run in the same per-session batch.
+          await get().restorePendingInteractive(sessionId);
+        }),
       );
     },
 
@@ -232,6 +295,7 @@ export function createSessionSlice({
         );
       }
       set({ selectingSessionId: id, page: "chat" });
+      const outcomeAcknowledgement = get().acknowledgeSessionOutcome(id);
 
       const commitSelection = (
         messages: UiMessage[],
@@ -351,6 +415,32 @@ export function createSessionSlice({
 
         detail ??= await detailPromise;
         if (!runtime.navigationIntentIsCurrent(intent)) return;
+        if (detail.session && sessionReadLooksEmpty(detail.session)) {
+          // A window read that comes back empty for a session the sidebar
+          // counts as having history is not an empty conversation (#795). Ask
+          // once more, and if the transcript still reads empty keep whatever
+          // the user already has and say so, instead of committing nothing and
+          // leaving a blank pane behind.
+          const reread = await runtime.loadSessionDetail(id, {
+            messageLimit: 100,
+            contentLimit: 64 * 1024,
+          });
+          if (!runtime.navigationIntentIsCurrent(intent)) return;
+          if (reread.session && sessionReadLooksEmpty(reread.session)) {
+            const retained =
+              runtime.sessionTranscriptCache.get(id) ??
+              get().retainedTranscripts[id];
+            if (retained && retained.length > 0) {
+              commitSelection(retained, true);
+            } else {
+              get().showToast(i18n.t("chat.sessionTranscriptEmpty"), {
+                variant: "error",
+              });
+            }
+            return;
+          }
+          detail = reread;
+        }
         const historyWindow = detail.session
           ? {
               messageStart: detail.session.messageStart ?? 0,
@@ -385,8 +475,47 @@ export function createSessionSlice({
         }
         rememberSessionCompactions(id, detail.session);
         void get().restorePendingPlan(id);
-        void get().acknowledgeSessionOutcome(id);
+        // Opening a session is where its unanswered cards become visible again
+        // after a renderer reload; the live stream only re-delivers new ones.
+        void get().restorePendingInteractive(id);
+        const selected = get().sessions.find((session) => session.id === id);
+        if (
+          selected &&
+          sessionNeedsModelPin(selected) &&
+          get().pendingPlans[id]?.status !== "pending"
+        ) {
+          const pin = pinnedSessionModelBinding({
+            session: selected,
+            messages: selectedMessages,
+            settings: get().settings,
+            providers: get().providers,
+          });
+          if (pin.providerId && pin.modelId) {
+            set((state) => ({
+              sessions: state.sessions.map((session) =>
+                session.id === id
+                  ? applyOptimisticSessionConfiguration(session, pin)
+                  : session,
+              ),
+            }));
+            if (get().activeSessionId === id) {
+              void get().configureActiveSession({
+                mode: selected.mode,
+                providerId: pin.providerId,
+                modelId: pin.modelId,
+                thinkingLevel: selected.thinkingLevel,
+              });
+            } else {
+              void api.configureSession(id, {
+                mode: selected.mode,
+                providerId: pin.providerId,
+                modelId: pin.modelId,
+              });
+            }
+          }
+        }
       } finally {
+        await outcomeAcknowledgement;
         if (runtime.isCurrentSessionSelection(selection)) {
           runtime.clearSessionSelection(selection);
           set((state) =>
@@ -501,10 +630,11 @@ export function createSessionSlice({
 
     forkAssistantMessage: async (messageId) => {
       const intent = runtime.beginNavigationIntent();
-      const state = await prepareTranscriptAction({ get, set }, runtime, messageId);
-      if (!state || !runtime.navigationIntentIsCurrent(intent)) return;
+      // Fork needs only the anchor id: the host reads the canonical prefix.
+      // Hydrating the source here would overwrite its concurrently streaming tail.
+      const state = get();
       const sessionId = state.activeSessionId;
-      if (!sessionId || state.runningSessions[sessionId]) return;
+      if (!sessionId || state.selectingSessionId) return;
       const message = state.messages.find((candidate) => candidate.id === messageId);
       const source = state.sessions.find((session) => session.id === sessionId);
       if (!message || message.role !== "assistant" || !source) return;
@@ -586,6 +716,20 @@ export function createSessionSlice({
           [sessionId]: result.session.mode === "plan" ? "planning" : "inactive",
         },
       }));
+    },
+
+    /** Abort one session's running turn, whether or not it is the visible one. */
+    abortSession: async (sessionId) => {
+      if (!sessionId) return;
+      try {
+        await api.abort(sessionId);
+      } finally {
+        set((state) => ({
+          isRunning:
+            state.activeSessionId === sessionId ? false : state.isRunning,
+          runningSessions: { ...state.runningSessions, [sessionId]: false },
+        }));
+      }
     },
   };
 }

@@ -1,10 +1,9 @@
-import { IPC, ErrorCodes, isGlobalPermissionMode, type AgentEventEnvelope, type AgentPromptRequest, type AgentSteerRequest, type UiMessage, type AgentQueuePushRequest, type AgentStopRequest, type AskToolResolution, type GlobalPermissionMode, type MessageUsage, type PlanExecutionFinishStatus, type PlanResolutionResult, type PlanResolveRequest, type PromptEnhancementRequest, type SessionSummarizeTitleRequest } from "@pi-desktop/shared";
+import { IPC, ErrorCodes, compactionRecordId, findSkillMentions, isGlobalPermissionMode, isRpcTimeoutError, type AgentEventEnvelope, type AgentPromptRequest, type AgentSteerRequest, type UiMessage, type AgentQueuePushRequest, type AgentStopRequest, type AskToolResolution, type GlobalPermissionMode, type MessageUsage, type PendingInteractiveRequests, type PlanExecutionFinishStatus, type PlanResolutionResult, type PlanResolveRequest, type PromptEnhancementRequest, type SessionSummarizeTitleRequest, type VoiceOrigin, canonicalThinkingLevel, type ThinkingLevel } from "@pi-desktop/shared";
 import type { FinishTurn } from "../runtime/plans";
 import { expandSlashInvocation, enhancePromptDraft, summarizeSessionTitle, visionFromModelConfig, type ComposerTemplate, type RuntimeProviderConfig } from "@pi-desktop/agent-runtime";
 import { OAUTH_AUTH_KIND, type VendorOAuth } from "../oauth";
 import { appendPromptFallbackPaths, durableUserMessageId, preparePromptAttachments, type PreparedPromptAttachment } from "../prompt-attachments";
-import { executionFromResponse } from "../plan-execution";
-import { resolveSessionMessageInput } from "../session-message-input";
+import { executionFromResponse, resolveSessionMessageInput } from "@pi-desktop/host-runtime";
 import type { AgentExtensionBridge } from "../agent-extensions";
 import type { AgentHostBridge } from "../agent-host-bridge";
 import type { AgentSidecar } from "../agent-sidecar";
@@ -13,6 +12,7 @@ import type { Logger } from "../logger";
 import type { PersistenceOutbox } from "../persistence-outbox";
 import type { ComposerCommandService } from "./composer-ipc";
 import type { IpcRegistrar } from "./types";
+import { withPromptEnhancementTimeout } from "../prompt-enhancement-timeout";
 
 export type AgentIpcDependencies = {
   registrar: IpcRegistrar;
@@ -54,6 +54,25 @@ function rejectNativeAgentOperation(sessionId: string): void {
   if (sessionId.startsWith("native-pi:")) {
     throw Object.assign(new Error("Operation is unsupported for native Pi sessions"), { errorCode: "NATIVE_PI_UNSUPPORTED" });
   }
+}
+
+function parseVoiceOrigin(value: unknown): VoiceOrigin | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw Object.assign(new Error("voiceOrigin is invalid"), { errorCode: ErrorCodes.INVALID_ARGUMENT });
+  }
+  const origin = value as Record<string, unknown>;
+  const keys = Object.keys(origin);
+  if (
+    keys.length !== 2 ||
+    !keys.includes("callId") ||
+    !keys.includes("operationId") ||
+    typeof origin.callId !== "string" || !origin.callId.trim() || origin.callId.length > 128 ||
+    typeof origin.operationId !== "string" || !origin.operationId.trim() || origin.operationId.length > 128
+  ) {
+    throw Object.assign(new Error("voiceOrigin is invalid"), { errorCode: ErrorCodes.INVALID_ARGUMENT });
+  }
+  return { callId: origin.callId, operationId: origin.operationId };
 }
 
 /** Register prompt, agent lifecycle, queue, approval and plan channels. */
@@ -123,29 +142,73 @@ export function registerAgentIpc({
     }
     const settings = await host.call<any>("settings.get");
     const launchSessionId = sessionId || `prompt-enhancement:${crypto.randomUUID()}`;
-    const launch = await resolveAgentRuntimeLaunch(
-      launchSessionId,
-      session ?? {},
-      settings,
-      {
+    // A pinned enhancement model is a preference, not a hard requirement: a
+    // pin whose provider was disabled, whose account was signed out, or whose
+    // binding no longer exists must not take the action down. Try the pin,
+    // fall back to the Composer's current model, and record why (ADR 0121).
+    const pinnedProviderId =
+      typeof settings?.promptEnhancementProviderId === "string"
+        ? settings.promptEnhancementProviderId.trim()
+        : "";
+    const pinnedModelId =
+      typeof settings?.promptEnhancementModelId === "string"
+        ? settings.promptEnhancementModelId.trim()
+        : "";
+    const composerProviderId =
+      typeof req.providerId === "string" ? req.providerId.trim() : undefined;
+    const composerModelId =
+      typeof req.modelId === "string" ? req.modelId.trim() : undefined;
+    // The enhancement carries its own reasoning level and never follows the
+    // conversation's: an unset value means "off", because a rewrite rarely
+    // benefits from reasoning and reasoning is the slow path.
+    const enhancementThinkingLevel =
+      typeof settings?.promptEnhancementThinkingLevel === "string"
+        ? settings.promptEnhancementThinkingLevel.trim()
+        : "";
+    const launchFor = (providerId?: string, modelId?: string) =>
+      resolveAgentRuntimeLaunch(launchSessionId, session ?? {}, settings, {
         mode: "agent",
-        providerId:
-          typeof req.providerId === "string" ? req.providerId.trim() : undefined,
-        modelId: typeof req.modelId === "string" ? req.modelId.trim() : undefined,
-        thinkingLevel: req.thinkingLevel,
-      },
-    );
+        providerId,
+        modelId,
+        thinkingLevel: (enhancementThinkingLevel || "off") as ThinkingLevel,
+      });
+    let launch: Awaited<ReturnType<typeof launchFor>>;
+    if (pinnedProviderId) {
+      try {
+        launch = await launchFor(pinnedProviderId, pinnedModelId || undefined);
+      } catch (error) {
+        logger.app("session", "warn", "prompt enhancement model unavailable", {
+          data: {
+            pinnedProviderId,
+            pinnedModelId: pinnedModelId || undefined,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        });
+        launch = await launchFor(composerProviderId, composerModelId);
+      }
+    } else {
+      launch = await launchFor(composerProviderId, composerModelId);
+    }
     const runtimeProvider = {
       ...launch.sidecarParams.provider,
       ...(launch.sidecarParams.provider.authKind === OAUTH_AUTH_KIND
         ? { resolveAuth: () => vendorOAuth.resolveAuth(launch.providerId) }
         : {}),
     } as RuntimeProviderConfig;
-    const enhancedDraft = await enhancePromptDraft(
-      runtimeProvider,
-      draft,
-      launch.sidecarParams.thinkingLevel,
-      { sessionId: launchSessionId },
+    // A pin, a slow gateway, or a stalled connection would otherwise hold this
+    // promise open indefinitely. Aborting is best-effort (the transport only
+    // consults the signal between provider retries); racing the promise is what
+    // actually guarantees the caller is released on time.
+    const enhancedDraft = await withPromptEnhancementTimeout((signal) =>
+      enhancePromptDraft(runtimeProvider, draft, canonicalThinkingLevel(launch.sidecarParams.thinkingLevel), {
+        signal,
+        sessionId: launchSessionId,
+        customTemplate: settings?.promptEnhancementCustomTemplate === true,
+        userTemplate:
+          typeof settings?.promptEnhancementUserTemplate === "string"
+            ? settings.promptEnhancementUserTemplate
+            : undefined,
+      }),
     );
     logger.app("session", "info", "prompt enhanced", {
       sessionId: sessionId || undefined,
@@ -212,6 +275,7 @@ export function registerAgentIpc({
         errorCode: ErrorCodes.INVALID_ARGUMENT,
       });
     }
+    const voiceOrigin = parseVoiceOrigin(req.voiceOrigin);
     // A steering input belongs to the turn it names: it is refused once that
     // turn was cancelled, has started finalizing, or no longer owns the session.
     if (!isTurnDispatchable(req.sessionId, req.expectedTurnId)) {
@@ -236,6 +300,7 @@ export function registerAgentIpc({
       createdAt: new Date().toISOString(),
       steering: true,
       ...(prepared.length ? { attachments: prepared.map((attachment) => attachment.message) } : {}),
+      ...(voiceOrigin ? { voiceOrigin } : {}),
     };
     // Revalidate inside the runtime after all file/host IO. A stale target must
     // never turn into a normal prompt or alter the next turn's configuration.
@@ -251,7 +316,13 @@ export function registerAgentIpc({
 
   handle(IPC.invoke.agentPrompt, async (req: AgentPromptRequest) => {
     if (!sidecar) throw new Error("sidecar unavailable");
+    const voiceOrigin = parseVoiceOrigin(req.voiceOrigin);
     if (req.sessionId.startsWith("native-pi:")) {
+      if (voiceOrigin) {
+        throw Object.assign(new Error("Live Voice work is unsupported for native Pi sessions"), {
+          errorCode: "NATIVE_PI_UNSUPPORTED",
+        });
+      }
       if (req.sessionMessageId || req.truncateFromMessageId || req.truncateBefore !== undefined || req.attachments?.length) {
         throw Object.assign(new Error("Native Pi continuation currently supports text prompts only"), {
           errorCode: ErrorCodes.INVALID_ARGUMENT,
@@ -398,28 +469,42 @@ export function registerAgentIpc({
     // /names stay literal text.
     let promptContent = sessionMessage?.content ?? req.content;
     let slashCommand: string | undefined;
-    if (!sessionMessage && req.content.startsWith("/")) {
+    let skillMentions: UiMessage["skillMentions"];
+    if (!sessionMessage && /(^|\s)\/\S/.test(req.content)) {
       try {
         const root = await optionalWorkspaceRoot();
         const commandEnd = req.content.search(/\s/);
-        const commandName = req.content.slice(
-          1,
-          commandEnd === -1 ? undefined : commandEnd,
-        );
+        const commandName = req.content.startsWith("/")
+          ? req.content.slice(1, commandEnd === -1 ? undefined : commandEnd)
+          : "";
         const commands = await composerCommandService.buildComposerCommands(
           launch.projectPath ?? root,
         );
         const command = commands.find((item) => item.name === commandName);
-        if (command?.kind === "skill" && command.skillId) {
-          const body = commandEnd === -1 ? "" : req.content.slice(commandEnd).trim();
+        const activeSkills = new Map(
+          commands.flatMap((item) => item.kind === "skill" && item.skillId
+            ? [[item.name, item.skillId] as const]
+            : []),
+        );
+        const mentions = findSkillMentions(req.content, activeSkills);
+        if (mentions.length > 0 && (!command || command.kind === "skill")) {
+          let body = "";
+          let end = 0;
+          for (const mention of mentions) {
+            body += req.content.slice(end, mention.start);
+            end = mention.end;
+          }
+          body = (body + req.content.slice(end)).trim();
+          const ids = [...new Set(mentions.map((mention) => mention.id))];
           promptContent = [
-            `Call the \`Skill\` tool with id ${JSON.stringify(command.skillId)} before answering this request. Follow the loaded skill instructions.`,
+            `Call the \`Skill\` tool with each of these ids before answering this request, in order: ${ids.map((id) => JSON.stringify(id)).join(", ")}. Follow the loaded skill instructions.`,
             body,
           ]
             .filter(Boolean)
             .join("\n\n");
           slashCommand = req.content;
-        } else {
+          skillMentions = mentions;
+        } else if (req.content.startsWith("/")) {
           const templates = await loadComposerTemplatesCached(root);
           const expansion = expandSlashInvocation(req.content, templates);
           if (expansion) {
@@ -486,7 +571,9 @@ export function registerAgentIpc({
       ...(preparedAttachments.length
         ? { attachments: preparedAttachments.map((attachment) => attachment.message) }
         : {}),
+      ...(voiceOrigin ? { voiceOrigin } : {}),
       ...(slashCommand ? { command: slashCommand } : {}),
+      ...(skillMentions ? { skillMentions } : {}),
       ...(revisionMeta?.revisionCount
         ? {
             revisionRootId: revisionMeta.rootUserId,
@@ -547,6 +634,11 @@ export function registerAgentIpc({
               data: attachment.inlineData,
             })),
           userMessageId: userMessage.id,
+          // Per-turn permission ceiling override (R1 leftover; spec §7.3). The
+          // sidecar records it on the turn context; enforcement of a NARROWER
+          // ceiling still routes through the session's stored mode until
+          // host-core `session.beginTurn` accepts the scoped param.
+          ...(req.permissionMode ? { permissionMode: req.permissionMode } : {}),
         },
       );
     } catch (e) {
@@ -589,7 +681,26 @@ export function registerAgentIpc({
       settings,
     );
     sidecar.setProjectInstructionRoot(req.sessionId, launch.projectPath);
-    const result = await sidecar.call("agent.compact", launch.sidecarParams);
+    // A lost reply is not the sidecar's verdict: the sidecar keeps summarizing
+    // and persists the checkpoint through host-core, so the durable record
+    // decides whether this manual compaction succeeded (issue #795).
+    const startedWith = compactionRecordId(detail.session);
+    let result: unknown;
+    try {
+      result = await sidecar.call("agent.compact", launch.sidecarParams);
+    } catch (error) {
+      if (!isRpcTimeoutError(error)) throw error;
+      const settled = await host.call<{ session?: unknown }>("session.get", {
+        id: req.sessionId,
+      });
+      const landed = compactionRecordId(settled.session);
+      if (landed === startedWith) throw error;
+      logger.app("session", "warn", "manual compaction outlived its transport deadline; the checkpoint landed", {
+        sessionId: req.sessionId,
+        data: { compactionId: landed },
+      });
+      return { accepted: true };
+    }
     logger.app("session", "info", "context compacted manually", {
       sessionId: req.sessionId,
       data: { providerId: launch.providerId, modelId: launch.modelId },
@@ -599,7 +710,12 @@ export function registerAgentIpc({
 
   handle(IPC.invoke.agentAbort, async (req: { sessionId: string; turnId?: string }) => {
     if (!sidecar) throw new Error("sidecar unavailable");
-    const releaseSessionOperation = req.turnId ? await acquireSessionOperation(req.sessionId) : undefined;
+    // Prompt admission holds this same session operation until the sidecar has
+    // accepted the turn. Waiting here closes the startup window where the
+    // renderer already shows Stop but activeTurns/runtime are not ready yet.
+    // Without the wait, agent.abort can return successfully while finding no
+    // runtime, and the prompt then starts after the user's first click.
+    const releaseSessionOperation = await acquireSessionOperation(req.sessionId);
     try {
     const abortedTurnId = activeTurns.get(req.sessionId);
     if (req.turnId && abortedTurnId !== req.turnId) return { ok: false, aborted: false };
@@ -644,8 +760,13 @@ export function registerAgentIpc({
 
   handle(IPC.invoke.agentStop, async (req: AgentStopRequest) => {
     if (!sidecar) throw new Error("sidecar unavailable");
+    const activeTurnId = activeTurns.get(req.sessionId);
+    if (req.turnId && activeTurnId !== req.turnId) {
+      return { requested: false };
+    }
     logger.app("session", "info", "prompt graceful stop requested", {
       sessionId: req.sessionId,
+      ...(req.turnId ? { turnId: req.turnId } : {}),
     });
     // The runtime owns the boundary decision. Do not close the durable turn
     // here: agent_end must arrive after the current reply/tool batch completes
@@ -681,6 +802,17 @@ export function registerAgentIpc({
     return { ok: true };
   });
 
+  handle(
+    IPC.invoke.agentQueueReorder,
+    async (req: { turnId: string; direction: "up" | "down" }) => {
+      if (!agentHostBridge) throw new Error("agent host unavailable");
+      if (req.direction !== "up" && req.direction !== "down") {
+        throw new Error(`unknown queue reorder direction: ${String(req.direction)}`);
+      }
+      return agentHostBridge.queue.reorder(req.turnId, req.direction);
+    },
+  );
+
   handle(IPC.invoke.toolResolvePermission, async (resolution: {
     requestId: string;
     decision: string;
@@ -710,6 +842,22 @@ export function registerAgentIpc({
       sessionId,
       requestId,
     });
+  });
+
+  /**
+   * Interactive cards a reloaded renderer rebuilds instead of losing: the ask
+   * questions the current agent runtime still holds plus Host-owned permission
+   * requests. Native Pi sessions own their own input path and answer empty.
+   */
+  handle(IPC.invoke.pendingInteractive, async (input: { sessionId?: string } = {}) => {
+    const sessionId = String(input.sessionId ?? "").trim();
+    if (!sessionId) {
+      throw Object.assign(new Error("sessionId required"), { errorCode: ErrorCodes.INVALID_ARGUMENT });
+    }
+    const empty: PendingInteractiveRequests = { asks: [], permissions: [] };
+    if (sessionId.startsWith("native-pi:")) return empty;
+    const bridge = getAgentHostBridge();
+    return bridge ? bridge.pendingInteractiveRequests(sessionId) : empty;
   });
 
   handle(IPC.invoke.plansPending, async (input: { sessionId?: string } = {}) => {

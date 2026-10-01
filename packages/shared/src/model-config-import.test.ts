@@ -172,6 +172,44 @@ requires_openai_auth = true
 });
 
 describe("parsePiModelConfig", () => {
+  it("imports without a secret when apiKey is a `!` shell command", () => {
+    const command = "!/usr/bin/security find-generic-password -w -a me -s svc";
+    for (const apiKey of [command, `  ${command}  `]) {
+      const drafts = parsePiModelConfig(
+        {
+          providers: {
+            radius: {
+              baseUrl: "https://api.example.com",
+              api: "anthropic-messages",
+              apiKey,
+              models: [{ id: "pi-model" }],
+            },
+          },
+        },
+        {},
+      );
+      expect(drafts).toHaveLength(1);
+      expect(drafts[0].secretValue).toBeUndefined();
+      expect(drafts[0].hasSecret).toBe(false);
+      expect(publicModelConfigCandidate(drafts[0]).hasSecret).toBe(false);
+    }
+  });
+
+  it("ignores a `!` shell command in an auth header", () => {
+    const drafts = parsePiModelConfig({
+      providers: {
+        radius: {
+          baseUrl: "https://api.example.com",
+          headers: { Authorization: "!security find-generic-password -w -s svc" },
+          models: [{ id: "pi-model" }],
+        },
+      },
+    });
+    expect(drafts).toHaveLength(1);
+    expect(drafts[0].secretValue).toBeUndefined();
+    expect(drafts[0].hasSecret).toBe(false);
+  });
+
   it("reads ~/.pi/agent/models.json providers, env: keys, and limits", () => {
     const drafts = parsePiModelConfig(
       {
@@ -390,6 +428,38 @@ describe("parseCcSwitchProviders", () => {
     });
     expect(rows).toHaveLength(1);
     expect(parseCcSwitchProviders(rows)[0]?.source).toBe("cc-switch");
+  });
+
+  // Regression: issue #588 — a stale cc-switch snapshot of ~/.pi/agent/models.json
+  // used to silently outrank the pi source and drop any models added after the
+  // one-shot sync. Rows with app_type='pi' must be ignored here so the "pi"
+  // scanner keeps ownership of the authoritative file.
+  it("skips app_type='pi' rows so the pi native config stays authoritative", () => {
+    const drafts = parseCcSwitchProviders([
+      {
+        id: "opencode-go",
+        appType: "pi",
+        name: "OpenCode Zen Go",
+        settingsConfig: {
+          baseUrl: "https://api.oj.ink/v1",
+          api: "openai-completions",
+          apiKey: "sk-pi",
+          // Stale snapshot: only nine of ten models — missing `deepseek-flash`.
+          models: [
+            { id: "m1" },
+            { id: "m2" },
+            { id: "m3" },
+            { id: "m4" },
+            { id: "m5" },
+            { id: "m6" },
+            { id: "m7" },
+            { id: "m8" },
+            { id: "m9" },
+          ],
+        },
+      },
+    ]);
+    expect(drafts).toEqual([]);
   });
 });
 
