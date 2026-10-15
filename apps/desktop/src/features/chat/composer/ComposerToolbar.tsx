@@ -6,6 +6,7 @@ import {
   type PermissionMode,
   type ShortcutPlatform,
   type SessionThinkingLevel,
+  type PluginComposerTransformMeta,
 } from "@pi-desktop/shared";
 import type { AppState } from "../../../stores/app-store";
 import { ComposerPermissionPicker } from "./ComposerPermissionPicker";
@@ -42,6 +43,9 @@ export type ComposerToolbarProps = {
   permissionOpen: boolean;
   setPermissionOpen: Dispatch<SetStateAction<boolean>>;
   controlsBlocked: boolean;
+  localToolsAllowed?: boolean;
+  attachmentsAllowed?: boolean;
+  stopAllowed?: boolean;
   pasting: boolean;
   pickAndAttach: () => Promise<void>;
   configureActiveSession: AppState["configureActiveSession"];
@@ -50,14 +54,14 @@ export type ComposerToolbarProps = {
   modelLabel: string;
   thinkingLabel: string;
   contextUsage: ContextUsage | null;
-  enhancementDraft: string;
   value: string;
   modelReady: boolean;
   sendBlocked: boolean;
-  enhancingPrompt: boolean;
-  enhancementUndoText: string | null;
-  enhancePrompt: () => Promise<void>;
-  undoPromptEnhancement: () => void;
+  composerTransforms: PluginComposerTransformMeta[];
+  activeTransformKey: string | null;
+  undoTransform: PluginComposerTransformMeta | null;
+  runComposerTransform: (transform: PluginComposerTransformMeta) => Promise<void>;
+  undoComposerTransform: () => void;
   runActive: boolean;
   hasDraftContent: boolean;
   abort: AppState["abort"];
@@ -66,7 +70,7 @@ export type ComposerToolbarProps = {
   workSessionLabel?: string;
 };
 
-/** Composer controls: mode, permission, model, enhancement, and send/stop. */
+/** Composer controls: mode, permission, model, plugin actions, and send/stop. */
 export function ComposerToolbar({
   t,
   mode,
@@ -78,6 +82,9 @@ export function ComposerToolbar({
   permissionOpen,
   setPermissionOpen,
   controlsBlocked,
+  localToolsAllowed = true,
+  attachmentsAllowed = true,
+  stopAllowed = true,
   pasting,
   pickAndAttach,
   configureActiveSession,
@@ -86,14 +93,14 @@ export function ComposerToolbar({
   modelLabel,
   thinkingLabel,
   contextUsage,
-  enhancementDraft,
   value,
   modelReady,
   sendBlocked,
-  enhancingPrompt,
-  enhancementUndoText,
-  enhancePrompt,
-  undoPromptEnhancement,
+  composerTransforms,
+  activeTransformKey,
+  undoTransform,
+  runComposerTransform,
+  undoComposerTransform,
   runActive,
   hasDraftContent,
   abort,
@@ -112,7 +119,7 @@ export function ComposerToolbar({
             className="icon-btn icon-btn-square"
             tooltip={t("chat.addFiles")}
             ariaLabel={t("chat.addFiles")}
-            disabled={controlsBlocked || pasting}
+            disabled={controlsBlocked || pasting || !attachmentsAllowed}
             onClick={() => {
               setPermissionOpen(false);
               void pickAndAttach();
@@ -121,7 +128,7 @@ export function ComposerToolbar({
             <IconPlus size={15} aria-hidden="true" />
           </TooltipButton>
         </div>
-        <LiveVoiceControls t={t} workSessionId={workSessionId} />
+        {localToolsAllowed ? <LiveVoiceControls t={t} workSessionId={workSessionId} /> : null}
         <TooltipButton
           type="button"
           className="icon-btn mode-chip composer-mode-chip"
@@ -174,11 +181,11 @@ export function ComposerToolbar({
                   });
                 }
           }} />
-        <ComposerControlSlots side="left" />
+        {localToolsAllowed ? <ComposerControlSlots side="left" /> : null}
       </div>
 
       <div className="composer-right">
-        <ComposerControlSlots side="right" />
+        {localToolsAllowed ? <ComposerControlSlots side="right" /> : null}
         {contextUsage ? <ContextUsageInspector {...contextUsage} /> : null}
         <ComposerModelPicker
           t={t}
@@ -191,38 +198,39 @@ export function ComposerToolbar({
           controlsBlocked={controlsBlocked}
           onCloseOtherMenus={() => setPermissionOpen(false)}
         />
-        <TooltipButton
-          type="button"
-          className={`icon-btn icon-btn-square composer-enhance-btn${enhancingPrompt ? " is-loading" : ""}`}
-          tooltip={t("chat.enhancePrompt")}
-          ariaLabel={enhancingPrompt ? t("chat.enhancingPrompt") : t("chat.enhancePrompt")}
-          aria-busy={enhancingPrompt}
-          disabled={
-            !enhancementDraft.trim() ||
-            enhancementDraft.trim().startsWith("/") ||
-            !modelReady ||
-            sendBlocked ||
-            enhancingPrompt
-          }
-          onClick={() => void enhancePrompt()}
-        >
-          {enhancingPrompt ? (
-            <>
-              <span className="tool-spinner" aria-hidden="true" />
-              <span>{t("chat.enhancingPrompt")}</span>
-            </>
-          ) : (
-            <IconSparkles size={15} aria-hidden="true" />
-          )}
-        </TooltipButton>
-        {enhancementUndoText !== null ? (
+        {composerTransforms.map((transform) => {
+          const key = `${transform.pluginId}/${transform.id}`;
+          const isActive = activeTransformKey === key;
+          return (
+          <TooltipButton
+            key={key}
+            type="button"
+            className={`icon-btn icon-btn-square composer-plugin-transform-btn${isActive ? " is-loading" : ""}`}
+            tooltip={transform.title}
+            ariaLabel={transform.title}
+            aria-busy={isActive}
+            disabled={
+              !value.trim() ||
+              value.trim().startsWith("/") ||
+              controlsBlocked ||
+              sendBlocked ||
+              pasting ||
+              activeTransformKey !== null
+            }
+            onClick={() => void runComposerTransform(transform)}
+          >
+            {isActive ? <span className="tool-spinner" aria-hidden="true" /> : <IconSparkles size={15} aria-hidden="true" />}
+          </TooltipButton>
+          );
+        })}
+        {undoTransform ? (
           <TooltipButton
             type="button"
-            className="icon-btn icon-btn-square composer-enhance-undo"
-            tooltip={t("chat.undoEnhancement")}
-            ariaLabel={t("chat.undoEnhancement")}
+            className="icon-btn icon-btn-square composer-plugin-transform-undo"
+            tooltip={undoTransform.undoTitle}
+            ariaLabel={undoTransform.undoTitle}
             disabled={controlsBlocked}
-            onClick={undoPromptEnhancement}
+            onClick={undoComposerTransform}
           >
             <IconUndo2 size={15} aria-hidden="true" />
           </TooltipButton>
@@ -233,6 +241,7 @@ export function ComposerToolbar({
             className="stop-btn"
             tooltip={t("chat.stopGenerating")}
             ariaLabel={t("chat.stopGenerating")}
+            disabled={!stopAllowed}
             onClick={() => void abort()}
           >
             <IconStop size={14} />

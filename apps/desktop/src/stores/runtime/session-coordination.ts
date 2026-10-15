@@ -37,6 +37,8 @@ export type PersistSessionOptions = {
   intent?: number;
   projectPath?: string | null;
   draftConfiguration?: DraftSessionConfiguration | null;
+  /** Run the new session in its own git worktree (ADR 0329). */
+  isolated?: boolean;
 };
 
 export type SessionCoordination = {
@@ -286,6 +288,7 @@ export function createSessionCoordination({
       draft: draftConfig,
       settings,
       providers: state.providers,
+      recentModels: state.recentModels,
     });
     const defaultProvider = state.providers.find(
       (provider) => provider.id === inherited.providerId,
@@ -319,6 +322,7 @@ export function createSessionCoordination({
         providerId: inherited.providerId,
         modelId: inherited.modelId,
         projectPath: projectPath ?? undefined,
+        ...(options.isolated ? { isolated: true } : {}),
       });
     } catch (error) {
       if (previousSessionId && runtime.navigationIntentIsCurrent(active)) {

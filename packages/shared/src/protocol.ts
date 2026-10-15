@@ -2,7 +2,7 @@ export const PROTOCOL_VERSION = 11 as const;
 export const SCHEMA_VERSION = 16 as const;
 export const APP_ID = "net.aiuo.pi-desktop";
 export const APP_NAME = "PI-Desktop";
-export const APP_VERSION = "0.16.0-beta.1";
+export const APP_VERSION = "0.20.1";
 
 export const APP_MENU_COMMANDS = [
   "newTask",
@@ -50,6 +50,11 @@ export type WindowControlAction = (typeof WINDOW_CONTROL_ACTIONS)[number];
 
 export const IPC = {
   invoke: {
+    storageGet: "pi-desktop/storage/get",
+    storageChoose: "pi-desktop/storage/choose",
+    storageMigrate: "pi-desktop/storage/migrate",
+    storageClearCache: "pi-desktop/storage/clearCache",
+    storageRemoveBackup: "pi-desktop/storage/removeBackup",
     appGetVersion: "pi-desktop/app/getVersion",
     appOpenFeedback: "pi-desktop/app/openFeedback",
     appHealth: "pi-desktop/app/health",
@@ -68,6 +73,8 @@ export const IPC = {
     updatesDownload: "pi-desktop/updates/download",
     updatesInstall: "pi-desktop/updates/install",
     updatesOpenReleases: "pi-desktop/updates/openReleases",
+    /** Persist the user's decision to stop nudging about one version (#1317). */
+    updatesDismiss: "pi-desktop/updates/dismiss",
     notificationList: "pi-desktop/notification/list",
     notificationMarkRead: "pi-desktop/notification/markRead",
     notificationMarkAllRead: "pi-desktop/notification/markAllRead",
@@ -76,7 +83,6 @@ export const IPC = {
     notificationSetViewingSession: "pi-desktop/notification/setViewingSession",
     agentPrompt: "pi-desktop/agent/prompt",
     agentSteer: "pi-desktop/agent/steer",
-    promptEnhance: "pi-desktop/prompt/enhance",
     speechTranscribe: "pi-desktop/speech/transcribe",
     speechSynthesize: "pi-desktop/speech/synthesize",
     speechGetStatus: "pi-desktop/speech/getStatus",
@@ -109,6 +115,7 @@ export const IPC = {
     liveVoiceWidgetVisibility: "pi-desktop/voice/live/widget/visibility",
     agentCompact: "pi-desktop/agent/compact",
     agentAbort: "pi-desktop/agent/abort",
+    agentStopSubagents: "pi-desktop/agent/stop-subagents",
     agentStop: "pi-desktop/agent/stop",
     agentQueuePush: "pi-desktop/agent/queue/push",
     agentQueueList: "pi-desktop/agent/queue/list",
@@ -129,8 +136,24 @@ export const IPC = {
     /** Validate and select a durable session from a reviewed host operation. */
     sessionOpen: "pi-desktop/session/open",
     sessionDelete: "pi-desktop/session/delete",
+    /** Isolated sessions in git worktrees (ADR 0329). */
+    worktreeProbe: "pi-desktop/worktree/probe",
+    worktreePreview: "pi-desktop/worktree/preview",
+    worktreeMerge: "pi-desktop/worktree/merge",
+    worktreePendingWork: "pi-desktop/worktree/pendingWork",
+    /** "Sync from project": project commits the session lacks, and the sync. */
+    worktreeBehind: "pi-desktop/worktree/behind",
+    worktreeSync: "pi-desktop/worktree/sync",
+    /** Behind counts of every isolated session, for the sidebar marker. */
+    worktreeBehindAll: "pi-desktop/worktree/behindAll",
+    worktreeSetupLog: "pi-desktop/worktree/setupLog",
+    /** Opens the worktree folder in the OS file manager; no path is returned. */
+    worktreeReveal: "pi-desktop/worktree/reveal",
+    worktreeSetupCommandGet: "pi-desktop/worktree/setupCommand/get",
+    worktreeSetupCommandSet: "pi-desktop/worktree/setupCommand/set",
     sessionRename: "pi-desktop/session/rename",
-    sessionSummarizeTitle: "pi-desktop/session/summarizeTitle",
+    /** Deterministic first-prompt title for a session that is still untitled. */
+    sessionDeriveTitle: "pi-desktop/session/deriveTitle",
     sessionConfigure: "pi-desktop/session/configure",
     sessionImportScan: "pi-desktop/session/importScan",
     sessionImportRun: "pi-desktop/session/importRun",
@@ -168,6 +191,7 @@ export const IPC = {
     projectMemoryGet: "pi-desktop/project/memory/get",
     projectMemorySave: "pi-desktop/project/memory/save",
     projectGroupList: "pi-desktop/project-group/list",
+    projectGroupCreateRemote: "pi-desktop/project-group/createRemote",
     projectGroupCreate: "pi-desktop/project-group/create",
     projectGroupRename: "pi-desktop/project-group/rename",
     projectGroupUpdate: "pi-desktop/project-group/update",
@@ -215,6 +239,13 @@ export const IPC = {
      * crosses this channel.
      */
     remoteHostBootstrap: "pi-desktop/remoteHost/bootstrap",
+    remoteHostReconnect: "pi-desktop/remoteHost/reconnect",
+    remoteHostProjects: "pi-desktop/remoteHost/projects",
+    remoteHostBrowseProjects: "pi-desktop/remoteHost/browseProjects",
+    remoteHostRegisterProject: "pi-desktop/remoteHost/registerProject",
+    remoteHostSessions: "pi-desktop/remoteHost/sessions",
+    remoteHostCreateSession: "pi-desktop/remoteHost/createSession",
+    remoteHostSyncProviders: "pi-desktop/remoteHost/syncProviders",
     providersList: "pi-desktop/providers/list",
     providersReorder: "pi-desktop/providers/reorder",
     providersCreate: "pi-desktop/providers/create",
@@ -227,6 +258,14 @@ export const IPC = {
      */
     providersSetSecret: "pi-desktop/providers/setSecret",
     providersTest: "pi-desktop/providers/testConnection",
+    /**
+     * Check a TypeSafe key before the Jev settings row keeps it.
+     *
+     * Jev is not a provider row, so `providersTest` cannot answer this: the
+     * key is checked by the same System One round trip the Agent's
+     * `JevClassify` tool makes, and only a key that answered is stored.
+     */
+    jevTest: "pi-desktop/jev/test",
     providersListModels: "pi-desktop/providers/listModels",
     /**
      * Look one model id up in the local models.dev snapshot.
@@ -249,6 +288,8 @@ export const IPC = {
     pluginList: "pi-desktop/plugin/list",
     /** A renderer slot component asking its own plugin for one JSON answer. */
     pluginRendererCall: "pi-desktop/plugin/rendererCall",
+    /** Invoke a declared, user-facing Composer transform action. */
+    pluginComposerTransform: "pi-desktop/plugin/composerTransform",
     /** Plugin-contributed agent extensions (D387/D388, ADR 0214). */
     pluginImportExtension: "pi-desktop/plugin/importExtension",
     extensionsCommandRun: "pi-desktop/extensions/commands/run",
@@ -277,6 +318,7 @@ export const IPC = {
     pluginLauncherToggle: "pi-desktop/pluginLauncher/toggle",
     pluginLauncherDismiss: "pi-desktop/pluginLauncher/dismiss",
     pluginThemes: "pi-desktop/plugin/themes",
+    pluginProviderCatalog: "pi-desktop/plugin/providerCatalog",
     pluginScenicThemesDestinations: "pi-desktop/plugin/scenicThemes/destinations",
     pluginScenicThemesSetBlur: "pi-desktop/plugin/scenicThemes/setBlur",
     pluginServices: "pi-desktop/plugin/services",
@@ -299,6 +341,8 @@ export const IPC = {
     mcpImportRun: "pi-desktop/mcp/importRun",
     mcpMarketSearch: "pi-desktop/mcp/market/search",
     skillList: "pi-desktop/skill/list",
+    skillBuiltinList: "pi-desktop/skill/builtin/list",
+    skillBuiltinSetEnabled: "pi-desktop/skill/builtin/setEnabled",
     skillCreate: "pi-desktop/skill/create",
     skillImport: "pi-desktop/skill/import",
     skillImportScan: "pi-desktop/skill/importScan",
@@ -398,6 +442,7 @@ export const IPC = {
     traySessionActivated: "pi-desktop/tray/event/sessionActivated",
     notificationChanged: "pi-desktop/notification/event/changed",
     sessionsChanged: "pi-desktop/session/event/changed",
+    remoteInteractions: "pi-desktop/remote/event/interactions",
     notificationActivated: "pi-desktop/notification/event/activated",
     notificationSound: "pi-desktop/notification/event/sound",
     plansChanged: "pi-desktop/plans/event/changed",

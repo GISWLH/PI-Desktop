@@ -66,6 +66,7 @@ export default defineConfig({
         // (D387); Electron main never calls it, and its transpiled dist
         // breaks the main bundle's esbuild transform.
         external: [
+          "original-fs",
           "electron-updater",
           "jiti",
           "jiti/static",
@@ -73,7 +74,7 @@ export default defineConfig({
           "transcribe-cpp",
         ],
         input: {
-          index: resolve(__dirname, "electron/main/index.ts"),
+          index: resolve(__dirname, "electron/main/entry.ts"),
           // Forked per plugin by PluginRuntime (ADR 0008); must stay a
           // standalone entry so utilityProcess can point at a real file.
           "plugin-host-process": resolve(__dirname, "electron/main/plugin-host-process.mjs"),

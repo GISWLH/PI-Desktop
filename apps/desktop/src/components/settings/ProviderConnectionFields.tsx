@@ -10,7 +10,7 @@
 import type { RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import type { CatalogApiStyle } from "@pi-desktop/shared";
-import { Field, Input } from "../ui";
+import { Field, Input, SettingsToggle } from "../ui";
 import { SettingsMenuSelect } from "./SettingsMenuSelect";
 import { ServiceMonogram } from "./ServiceMonogram";
 import { endpointLabel } from "./service-catalog";
@@ -22,13 +22,19 @@ export type ProviderConnectionFieldsProps = {
   editing: boolean;
   saving: boolean;
   serviceLabel: string;
+  /** Optional hint for a key that belongs to a Host-owned plugin row. */
+  apiKeyHint?: string;
   /** Endpoint the named preset talks to; empty on a custom endpoint. */
   serviceBaseUrl: string;
+  /** Hides service switching when the manifest owns this provider row. */
+  lockedService?: boolean;
   onChangeService: () => void;
   apiKeyRef: RefObject<HTMLInputElement | null>;
   nameRef: RefObject<HTMLInputElement | null>;
   apiKey: string;
   onApiKeyChange: (value: string) => void;
+  noApiKeyRequired: boolean;
+  onNoApiKeyRequiredChange: (required: boolean) => void;
   name: string;
   onNameChange: (value: string) => void;
   baseUrl: string;
@@ -49,12 +55,16 @@ export function ProviderConnectionFields({
   editing,
   saving,
   serviceLabel,
+  apiKeyHint,
   serviceBaseUrl,
+  lockedService = false,
   onChangeService,
   apiKeyRef,
   nameRef,
   apiKey,
   onApiKeyChange,
+  noApiKeyRequired,
+  onNoApiKeyRequiredChange,
   name,
   onNameChange,
   baseUrl,
@@ -90,20 +100,22 @@ export function ProviderConnectionFields({
                 </span>
               ) : null}
             </span>
-            <button
-              type="button"
-              className="provider-service-chip-change"
-              disabled={saving}
-              onClick={onChangeService}
-            >
-              {t("settings.changeService")}
-            </button>
+            {!lockedService ? (
+              <button
+                type="button"
+                className="provider-service-chip-change"
+                disabled={saving}
+                onClick={onChangeService}
+              >
+                {t("settings.changeService")}
+              </button>
+            ) : null}
           </div>
         </div>
 
         {named ? (
           <div className="provider-setup-key">
-            <Field label={t("settings.apiKey")} hint={keyHint}>
+            <Field label={t("settings.apiKey")} hint={apiKeyHint ?? keyHint}>
               <Input
                 ref={apiKeyRef}
                 type="password"
@@ -157,17 +169,36 @@ export function ProviderConnectionFields({
             </div>
           </div>
           <div className="provider-setup-field-row provider-setup-custom-auth-row">
-            <Field label={t("settings.apiKey")} hint={keyHint}>
-              <Input
-                ref={apiKeyRef}
-                type="password"
-                value={apiKey}
-                placeholder="sk-…"
-                className="font-mono text-sm-plus"
-                autoComplete="off"
-                onChange={(event) => onApiKeyChange(event.target.value)}
-              />
-            </Field>
+            <div className="provider-setup-key">
+              <Field label={t("settings.apiKey")} hint={keyHint}>
+                <Input
+                  ref={apiKeyRef}
+                  type="password"
+                  value={apiKey}
+                  placeholder="sk-…"
+                  className="font-mono text-sm-plus"
+                  autoComplete="off"
+                  disabled={saving || noApiKeyRequired}
+                  onChange={(event) => onApiKeyChange(event.target.value)}
+                />
+              </Field>
+              <div className="provider-setup-no-api-key-option">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-sm text-text-secondary">
+                    {t("settings.noApiKeyRequired")}
+                  </span>
+                  <SettingsToggle
+                    checked={noApiKeyRequired}
+                    label={t("settings.noApiKeyRequired")}
+                    disabled={saving}
+                    onChange={() => onNoApiKeyRequiredChange(!noApiKeyRequired)}
+                  />
+                </div>
+                <p className="text-xs text-text-muted">
+                  {t("settings.noApiKeyHint")}
+                </p>
+              </div>
+            </div>
             <Field
               label={t("settings.apiStyle")}
               hint={apiStyleNote ?? (accountOnlyApiStyle ? t(requiresApiStyleChoice

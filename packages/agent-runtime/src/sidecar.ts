@@ -1,3 +1,4 @@
+import { parseMcpServerIds, parseMcpToolNames } from "./mcp-tool-selection.js";
 /**
  * Node pi agent sidecar.
  * Protocol: NDJSON JSON-RPC on stdio with Electron main.
@@ -105,6 +106,8 @@ type RuntimeParams = {
   turnId?: string;
   thinkingLevel?: SessionThinkingLevel;
   infiniteProviderRetry?: boolean;
+  /** Opt-in TypeSafe classifier credential resolved by Electron main. */
+  jevApiKey?: string;
   provider: RuntimeProviderConfig;
   commandShell: CommandShellOption;
   pluginTools?: PluginToolDef[];
@@ -120,6 +123,9 @@ type RuntimeParams = {
   scratchDir?: string;
   /** Session-bound workspace root supplied by Electron main. */
   projectPath?: string;
+  remoteWorkspace?: { hostKey: string; path: string };
+  /** An isolated session's worktree root, supplied by Electron main (ADR 0329). */
+  workspaceRoot?: string;
   customSystemPrompt?: CustomSystemPrompt;
   projectInstructions?: ProjectInstructions;
   projectMemory?: string;
@@ -228,10 +234,13 @@ async function runtimeFor(
     subagents,
     subagentProviders,
     subagentModelKeys,
+    jevApiKey: params.jevApiKey,
     projectInstructions: params.projectInstructions,
     customSystemPrompt: params.customSystemPrompt,
     projectMemory: params.projectMemory,
     projectPath: params.projectPath,
+    remoteWorkspace: params.remoteWorkspace,
+    workspaceRoot: params.workspaceRoot,
     commandShell: params.commandShell,
   })
     ? existing
@@ -241,6 +250,7 @@ async function runtimeFor(
     runtimes.delete(sessionId);
   }
   if (reusable) {
+    reusable.setPluginSkills(pluginSkills);
     reusable.setCompactionSettings(params.compactionSettings);
     reusable.setInfiniteProviderRetry(params.infiniteProviderRetry === true);
     reusable.setMode(mode);
@@ -260,15 +270,14 @@ async function runtimeFor(
     // The current prompt is sent separately below. Exclude its persisted row
     // before attachment hydration so it cannot consume the history byte budget.
     if (currentPrompt !== undefined && params.userMessageId) {
-      const last = restoredMessages.at(-1);
-      if (last?.role === "user" && last.id === params.userMessageId) {
-        restoredMessages = restoredMessages.slice(0, -1);
-      }
+      restoredMessages = restoredMessages.filter((message) =>
+        message.role !== "user" || message.id !== params.userMessageId,
+      );
     }
     const supportsVision = visionFromModelConfig(params.provider.modelConfig);
     history = await hydrateAttachmentHistory(restoredMessages, {
       scratchDir: params.scratchDir,
-      projectPath: params.projectPath,
+      projectPath: params.remoteWorkspace ? undefined : params.projectPath,
       attachmentsDir: params.attachmentsDir,
       supportsVision,
     });
@@ -292,6 +301,7 @@ async function runtimeFor(
     commandShell: params.commandShell,
     thinkingLevel,
     infiniteProviderRetry: params.infiniteProviderRetry === true,
+    jevApiKey: params.jevApiKey,
     history,
     compaction,
     compactionSettings: params.compactionSettings,
@@ -302,6 +312,8 @@ async function runtimeFor(
     subagentProviders,
     subagentModelKeys,
     projectPath: params.projectPath,
+    remoteWorkspace: params.remoteWorkspace,
+    workspaceRoot: params.workspaceRoot,
     customSystemPrompt: params.customSystemPrompt,
     projectInstructions: params.projectInstructions,
     projectMemory: params.projectMemory,
@@ -370,7 +382,13 @@ async function handle(method: string, params: any): Promise<unknown> {
     case "sidecar.configure": {
       // Main owns host-core; sidecar only keeps config metadata.
       if (params && typeof params === "object" && "networkProxy" in params) {
-        applyNodeNetworkProxy(normalizeNetworkProxy(params.networkProxy));
+        applyNodeNetworkProxy(
+          normalizeNetworkProxy(params.networkProxy),
+          process.env,
+          typeof params.systemProxyRelayUrl === "string"
+            ? params.systemProxyRelayUrl
+            : undefined,
+        );
       }
       return { ok: true, mode: "host-proxy" };
     }
@@ -444,6 +462,8 @@ async function handle(method: string, params: any): Promise<unknown> {
       }
       const prompt: RuntimePrompt = {
         text: content,
+        mcpServerIds: parseMcpServerIds(params.mcpServerIds),
+        mcpToolNames: parseMcpToolNames(params.mcpToolNames),
         attachments,
         ...(params.sessionMessage ? { sessionMessage: params.sessionMessage as SessionMessageOrigin } : {}),
       };
@@ -472,7 +492,7 @@ async function handle(method: string, params: any): Promise<unknown> {
       const expectedTurnId = String(params.expectedTurnId ?? "");
       if (method === "agent.steeringContext") return runtime.steeringContext(expectedTurnId);
       return runtime.steer(
-        { text: String(params.content ?? ""), attachments: params.attachments },
+        { text: String(params.content ?? ""), attachments: params.attachments, mcpServerIds: parseMcpServerIds(params.mcpServerIds), mcpToolNames: parseMcpToolNames(params.mcpToolNames) },
         expectedTurnId,
         params.message,
       );
@@ -523,6 +543,16 @@ async function handle(method: string, params: any): Promise<unknown> {
         await runtime.abort();
       }
       return { ok: true };
+    }
+    case "agent.stopSubagents": {
+      const runtime = runtimes.get(String(params.sessionId));
+      if (!runtime) throw new Error("No active runtime for this session");
+      const ids = params.delegationIds;
+      if (ids !== undefined && (!Array.isArray(ids) || ids.length === 0 || ids.length > 100 || ids.some(id => typeof id !== "string" || !id.trim()))) {
+        throw new Error("Invalid delegation IDs");
+      }
+      const result = await runtime.stopSubagents(ids as string[] | undefined);
+      return { pending: result.details.stopPending?.flatMap(record => typeof record.delegationId === "string" ? [record.delegationId] : []) ?? [] };
     }
     case "agent.stop": {
       const sessionId = String(params.sessionId);

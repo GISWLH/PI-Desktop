@@ -77,9 +77,10 @@ PluginManager
 
 附带的 `pluginChanged` 事件带有 `reason`，以便渲染器可以决定
 重新获取的内容：`install`、`loadDev`、`enable`、`disable`、`uninstall`、`crash`、
-`service`、`market.install`、`market.applyUpdates`。 `service` 在每个
+`service`、`restore`、`market.install`、`market.applyUpdates`。 `service` 在每个
 监管过渡是其中最便宜的——只需要服务列表
-重新加载。
+重新加载。`restore` 在启动恢复把已启用的插件加载完之后发出一次，
+让早于它取过清单的界面仍能看到这些插件。
 
 ## 4. 1 事件（主机→插件进程）
 
@@ -114,6 +115,10 @@ PluginManager
   来自选择器的插件主题
 
 ## 6. RuntimeBroker 调用链
+
+`plugin.session.autoTitleContext` 和 `plugin.session.setAutoTitle` 属于
+`session.autoTitle` 权限管控的白名单能力。前者只读取默认标题会话的有界首轮文本；后者
+在 Rust host-core 内通过精确标题 CAS 更新。它们不复用插件拥有会话的转录读取 API。
 
 插件 API 调用：
 

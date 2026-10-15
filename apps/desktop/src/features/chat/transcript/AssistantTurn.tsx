@@ -23,6 +23,8 @@ import {
   resolveThinkingDisplayMode,
   shouldGroupTurnProcess,
 } from "../../../lib/turn-process";
+import { sessionAllows } from "../../../lib/remote-session-safety";
+import { useSlotSessionId } from "../../../plugins/renderer-slots/use-slots";
 import { useAppStore } from "../../../stores/app-store";
 import { IconBranch, IconReview } from "../../../components/icons";
 import { TooltipButton } from "../../../components/ui";
@@ -53,6 +55,7 @@ import { slotMessage } from "../../../plugins/renderer-slots/slot-message";
 type AssistantTurnProps = {
   entry: AssistantTurnEntry;
   isActive: boolean;
+  delegationsLive?: boolean;
   runtimeActivity?: AgentActivity;
 };
 
@@ -60,7 +63,7 @@ function assistantTurnPropsEqual(
   previous: AssistantTurnProps,
   next: AssistantTurnProps,
 ) {
-  if (previous.isActive !== next.isActive || previous.runtimeActivity !== next.runtimeActivity) return false;
+  if (previous.isActive !== next.isActive || previous.delegationsLive !== next.delegationsLive || previous.runtimeActivity !== next.runtimeActivity) return false;
   if (previous.entry === next.entry) return true;
   if (
     previous.entry.id !== next.entry.id ||
@@ -130,11 +133,13 @@ export function TranscriptEntryView({
   entry,
   isRunning,
   isActive,
+  delegationsLive,
   runtimeActivity,
 }: {
   entry: TranscriptEntry;
   isRunning: boolean;
   isActive: boolean;
+  delegationsLive?: boolean;
   runtimeActivity?: AgentActivity;
 }) {
   if (entry.kind === "assistant-turn") {
@@ -142,6 +147,7 @@ export function TranscriptEntryView({
       <AssistantTurn
         entry={entry}
         isActive={isActive}
+        delegationsLive={delegationsLive}
         runtimeActivity={runtimeActivity}
       />
     );
@@ -161,6 +167,7 @@ function transcriptEntryKey(entry: TranscriptEntry): string {
 type TranscriptHistoryProps = {
   entries: TranscriptEntry[];
   isRunning: boolean;
+  liveDelegations?: ReadonlyMap<string, true>;
 };
 
 /**
@@ -171,6 +178,7 @@ type TranscriptHistoryProps = {
 export const TranscriptHistory = memo(function TranscriptHistory({
   entries,
   isRunning,
+  liveDelegations,
 }: TranscriptHistoryProps) {
   return (
     <>
@@ -180,6 +188,7 @@ export const TranscriptHistory = memo(function TranscriptHistory({
           entry={entry}
           isRunning={isRunning}
           isActive={false}
+          delegationsLive={entry.kind === "assistant-turn" && liveDelegations?.has(entry.id)}
         />
       ))}
     </>
@@ -187,6 +196,7 @@ export const TranscriptHistory = memo(function TranscriptHistory({
 }, (previous, next) => {
   if (
     previous.isRunning !== next.isRunning ||
+    previous.liveDelegations !== next.liveDelegations ||
     previous.entries.length !== next.entries.length
   ) {
     return false;
@@ -226,6 +236,7 @@ export const TranscriptTail = memo(function TranscriptTail({
 export const AssistantTurn = memo(function AssistantTurn({
   entry,
   isActive,
+  delegationsLive,
   runtimeActivity,
 }: AssistantTurnProps) {
   const { t } = useTranslation();
@@ -233,6 +244,9 @@ export const AssistantTurn = memo(function AssistantTurn({
   const { copyText, selectText } = useChatTextActions();
   const retryAssistantMessage = useAppStore((s) => s.retryAssistantMessage);
   const forkAssistantMessage = useAppStore((s) => s.forkAssistantMessage);
+  const paneSessionId = useSlotSessionId();
+  const session = useAppStore((s) => s.sessions.find((item) => item.id === paneSessionId));
+  const canEditMessages = sessionAllows(session ?? (paneSessionId.startsWith("remote:") ? { id: paneSessionId } : undefined), "canEditMessages");
   const summary = getAssistantTurnSummary(entry);
   const { actionMessage, metaMessage, latestUsageMessage, usage, responseDurationMs, responseOutputTokens } = summary;
   const modelId = metaMessage?.modelId ?? latestUsageMessage?.modelId;
@@ -264,7 +278,7 @@ export const AssistantTurn = memo(function AssistantTurn({
               ".message-bubble",
             ),
           ].at(-1) ?? null,
-        complete: complete && Boolean(actionMessage),
+        complete: complete && Boolean(actionMessage) && canEditMessages,
         actions: { copyText, selectText },
         onRegenerate: () => {
           if (actionMessage) void retryAssistantMessage(actionMessage.id);
@@ -288,8 +302,8 @@ export const AssistantTurn = memo(function AssistantTurn({
   // or text and never on a Task's attached child transcript identity.
   const delegationItems = useMemo(() => tools.map((message) => ({ kind: "tool" as const, message })), [tools]);
   const rawDelegationStatuses = useMemo(
-    () => collectDelegationStatuses(delegationItems, { turnLive: isActive }),
-    [delegationItems, isActive],
+    () => collectDelegationStatuses(delegationItems, { turnLive: isActive || delegationsLive === true }),
+    [delegationItems, isActive, delegationsLive],
   );
   const rawDelegationTimings = useMemo(
     () => collectDelegationTimings(delegationItems),
@@ -314,9 +328,9 @@ export const AssistantTurn = memo(function AssistantTurn({
       resolveThinkingDisplayMode(state.settings?.thinkingDisplayMode),
     ),
   );
-  const { process, responses, lastActivityPart } = summary;
+  const { process, responses } = summary;
   const activePart = isActive ? entry.parts.at(-1) : undefined;
-  const partContext = { isActive, activePart, lastActivityPart, runtimeActivity, turnDelegationStatuses, turnDelegationTimings };
+  const partContext = { isActive, activePart, runtimeActivity, turnDelegationStatuses, turnDelegationTimings };
 
   return (
     <div
@@ -352,22 +366,22 @@ export const AssistantTurn = memo(function AssistantTurn({
             <MessageTimestamp createdAt={actionMessage.createdAt} />
             <ActionSlotSide slot="assistantAction" side="left" message={slotReply} />
             <CopyButton text={content} label={t("chat.copy")} />
-            <TooltipButton
+            {canEditMessages ? <TooltipButton
               className="copy-btn icon"
               tooltip={t("chat.forkResponse")}
               ariaLabel={t("chat.forkResponse")}
               onClick={() => void forkAssistantMessage(actionMessage.id)}
             >
               <IconBranch size={13} />
-            </TooltipButton>
-            <TooltipButton
+            </TooltipButton> : null}
+            {canEditMessages ? <TooltipButton
               className="copy-btn icon"
               tooltip={t("chat.retry")}
               ariaLabel={t("chat.retry")}
               onClick={() => void retryAssistantMessage(actionMessage.id)}
             >
               <IconReview size={13} />
-            </TooltipButton>
+            </TooltipButton> : null}
             <ActionSlotSide slot="assistantAction" side="right" message={slotReply} />
           </div>
         ) : null}

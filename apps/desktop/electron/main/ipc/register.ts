@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { dialog, type BrowserWindow, type IpcMain, type IpcMainInvokeEvent } from "electron";
+import { dialog, shell, type BrowserWindow, type IpcMain, type IpcMainInvokeEvent } from "electron";
 import { err, ErrorCodes, IPC, ok, type Result } from "@pi-desktop/shared";
 import type { AgentHostBridge } from "../agent-host-bridge";
 import type { AgentSidecar } from "../agent-sidecar";
@@ -17,16 +17,19 @@ import { searchMcpMarket } from "../mcp-registry-catalog";
 import { registerNotificationIpc } from "./notification-ipc";
 import { registerPluginIpc } from "./plugin-ipc";
 import { registerPluginUiIpc } from "./plugin-ui-ipc";
+import { registerJevIpc } from "./jev-ipc";
 import { registerProviderIpc } from "./provider-ipc";
 import { registerScheduledIpc } from "./scheduled-ipc";
 import { registerSessionIpc } from "./session-ipc";
 import { registerSettingsIpc } from "./settings-ipc";
+import { registerStorageIpc } from "../storage/ipc";
 import { registerConfigSyncIpc } from "./config-sync-ipc";
 import { registerSkillsIpc } from "./skills-ipc";
 import { registerAgentImportIpc } from "./agent-import-ipc";
 import { registerRemoteHostIpc } from "./remote-host-ipc";
 import { fetchSkillMarketDocument, searchSkillMarket } from "../skill-market-catalog";
 import { registerWindowIpc } from "./window-ipc";
+import { registerWorktreeIpc } from "./worktree-ipc";
 import { createComposerTemplateLoader, registerWorkspaceIpc } from "./workspace-ipc";
 import { registerComposerIpc } from "./composer-ipc";
 import { registerSpeechIpc } from "./speech-ipc";
@@ -58,8 +61,10 @@ export type RegisterIpcDependencies = {
   setNotificationViewingSessionId: (sessionId: string | null) => void;
   activeUserSubagentDocuments: (...args: any[]) => Promise<any>;
   disabledBuiltinSubagents: () => Promise<string[]>;
+  disabledBuiltinSkills: () => Promise<string[]>;
   liveCallService?: LiveCallService;
   liveVoiceWidget?: LiveVoiceWidget;
+  restartForStorage: () => void;
   mcpOAuth?: McpOAuthManager;
   [name: string]: any;
 };
@@ -101,6 +106,9 @@ export function registerIpcHandlers(dependencies: RegisterIpcDependencies) {
     sessionCapabilityContext,
     enrichSession,
     acquireSessionOperation,
+    beginTranscriptRewrite,
+    forgetTranscriptRewriteHistory,
+    recordTurnStart,
     stripWinLongPrefix,
     normalizeSettings,
     validateSettingsWrite,
@@ -122,6 +130,7 @@ export function registerIpcHandlers(dependencies: RegisterIpcDependencies) {
     activeUserSkills,
     activeUserSubagentDocuments,
     disabledBuiltinSubagents,
+    disabledBuiltinSkills,
     pluginActiveInProject,
     getWorkPanelReservationWidth,
     setWorkPanelReservationWidth,
@@ -237,6 +246,7 @@ export function registerIpcHandlers(dependencies: RegisterIpcDependencies) {
     safeOpenExternal,
     updater,
   });
+  registerStorageIpc({ registrar, getMainWindow, restart: dependencies.restartForStorage });
   registerNotificationIpc({
     registrar,
     getHost,
@@ -258,6 +268,8 @@ export function registerIpcHandlers(dependencies: RegisterIpcDependencies) {
     sessionCapabilityContext,
     enrichSession,
     acquireSessionOperation,
+    beginTranscriptRewrite,
+    forgetTranscriptRewriteHistory,
     stripWinLongPrefix,
   });
   registerSettingsIpc({
@@ -295,13 +307,24 @@ export function registerIpcHandlers(dependencies: RegisterIpcDependencies) {
     bindingForModel,
     onProviderInvalidated: (providerId) => liveCallService?.invalidateProvider(providerId),
   });
+  registerJevIpc({ registrar, logger });
+  registerWorktreeIpc({
+    registrar,
+    getHost,
+    logger,
+    openPath: (path) => shell.openPath(path),
+    stripWinLongPrefix,
+  });
   const loadComposerTemplatesCached = createComposerTemplateLoader(logger);
   const composerCommandService = registerComposerIpc({
     registrar,
+    userMcp,
+    refreshUserMcp,
     plugins,
     agentExtensions,
     optionalWorkspaceRoot,
     activeUserSkills,
+    disabledBuiltinSkills,
     pluginActiveInProject,
     loadComposerTemplatesCached,
   });
@@ -380,11 +403,11 @@ export function registerIpcHandlers(dependencies: RegisterIpcDependencies) {
       userMcp.cancelSessionCalls(sessionId);
     },
     logger,
-    vendorOAuth,
     agentExtensions,
     persistenceOutbox,
     dataDir,
     activeTurns,
+    recordTurnStart,
     isTurnDispatchable,
     activeTurnUsages,
     approvedExecutionIdsBySession,
@@ -438,6 +461,7 @@ export function registerIpcHandlers(dependencies: RegisterIpcDependencies) {
     optionalWorkspaceRoot,
     activeUserSubagentDocuments,
     disabledBuiltinSubagents,
+    disabledBuiltinSkills,
     stripWinLongPrefix,
     sendToRenderer,
     logger,

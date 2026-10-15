@@ -81,10 +81,11 @@ PluginManager
 
 The shipped `pluginChanged` event carries a `reason` so the renderer can decide
 what to refetch: `install`, `loadDev`, `enable`, `disable`, `uninstall`, `crash`,
-`service`, `market.install`, `market.applyUpdates`, `themes` (runtime
+`service`, `restore`, `market.install`, `market.applyUpdates`, `themes` (runtime
 `themes.upsert` / `themes.remove`). `service` fires on every
 supervision transition and is the cheapest of them — only the service list needs
-a reload.
+a reload. `restore` fires once when startup recovery has loaded the enabled
+plugins, so a surface that listed them earlier still sees them.
 
 `settingsChanged` (`pi-desktop/app/event/settingsChanged`) carries a settings
 patch when the **host** writes app settings outside the renderer path — today
@@ -226,6 +227,19 @@ toast plus `pluginChanged` to the renderer.
 2. The command palette IPC can execute plugin commands
 3. Start/stop triggers contribution registration/deregistration
 4. The market IPC runs end-to-end under a mock provider (later milestone)
+
+The title plugin uses two narrow plugin session RPC methods after the Electron
+broker enforces `session.autoTitle`:
+
+- `plugin.session.autoTitleContext` returns only the first user message and
+  first assistant reply, each character-bounded, and only while `title_source`
+  is `default`.
+- `plugin.session.setAutoTitle` validates the title and updates it only when
+  both the expected title and `default` source still match. A successful update
+  triggers the ordinary host-owned `sessionsChanged` event.
+
+These methods are additive to host RPC protocol v11. They do not grant access to
+`plugin.session.listMessages` or the general session transcript.
 
 ## Appendix: agent-tool dispatch protocol (implemented M5)
 

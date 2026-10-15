@@ -14,8 +14,8 @@ Therefore:
 ## 2. Selection UX
 
 Model configuration is **discovery-first**: the AI service is the authority on
-which models it serves, so the service's own endpoint is asked first and
-Pi catalog is used only to enrich what came back. The bundled catalog is never
+which models it serves, so the service's own endpoint is asked first and the
+models.dev catalog is used only to enrich what came back. The bundled catalog is never
 presented as a browsable list of every published model — a deployment does not
 necessarily host everything its vendor publishes, and a key is not necessarily
 entitled to it.
@@ -26,7 +26,10 @@ entitled to it.
 
 - **Name**, **Base URL** and **API Key** are all on screen at once. An empty key
   when editing means “keep the stored one”; `secretValue` is only sent when the
-  user typed something.
+  user typed something. Custom endpoints also offer an explicit **No API key
+  required** switch, defaulting off for new rows. When enabled, the key field is
+  disabled and cleared, and the row saves with `authKind: "none"` and no
+  secret. Named cloud services keep their existing authentication defaults.
 - The models section lists what the service returned. `useProviderModels`
   debounces edits by 600 ms, guards against out-of-order replies with a
   monotonic request sequence, and needs no API key so local and no-auth
@@ -69,8 +72,11 @@ entitled to it.
   mapping, the runtime sends that canonical value through to the adapter rather
   than letting the adapter clamp it to `high`. Existing non-null catalog
   mappings remain authoritative for providers that translate the level.
-- The wire API is derived from the provider's published `npm` adapter
-  (`apiStyleForAdapter`) and is only editable inside **Advanced**.
+- Named service defaults may derive their wire API from the provider's
+  published `npm` adapter (`apiStyleForAdapter`). A custom endpoint's saved
+  API style is the selected gateway format and takes precedence over a model's
+  published adapter; named and OAuth providers may keep a model-level wire API
+  pin when their catalog requires it.
 - A custom model ID is always accepted, so a gateway without a `/models` route
   stays usable.
 
@@ -136,7 +142,12 @@ The answer also replaces the previous one. A probe that no longer publishes a
 model drops that model's row, so the pane stops painting a model the endpoint
 retired and a hand-typed id stops inheriting its old limits; a row whose source
 is not discovery — the user's own — is never dropped this way, and a configured
-binding stays visible even when the service stops listing it. Cached rows carry
+binding stays visible in the chosen-model pane even when the service stops
+listing it. After a live refresh, the service-model pane displays only rows
+actually served, excluding configured-only rows marked `source: "user"`.
+Catalog enrichment preserves that origin independently of published metadata;
+cache, catalog and manual fallbacks still expose configured rows for editing.
+Cached rows carry
 no endpoint of their own, so a save that moves the base URL or the wire format
 drops the answer the previous endpoint produced, and the next probe records the
 new one. A failed or empty probe is not an answer: it never reaches the cache,
@@ -175,9 +186,21 @@ provider disappears from the picker.
 
 The sheet also offers an ordered **Fallback models** list using that same
 configured-model picker. Users can add, move up/down, or remove alternatives.
-Already-selected models are excluded from the add menu. Saved pins that become
-unavailable stay visible and removable; reopening or editing another field
-must not drop them. Clearing the list saves `fallbackModels: []`. Inherit-session
+Already-selected models are excluded from the add menu. Saved-row display
+identity is resolved from all configured providers, independently of which
+models are currently selectable. A configured provider keeps its display name
+and the saved model ID after it is disabled, with a localized disabled status;
+disabling it must not turn its label back into a raw provider UUID. Other
+unavailable bindings are marked unavailable. Exact stored provider IDs take
+precedence over aliases, and ambiguous aliases are not guessed. Only an
+unresolved provider or model binding retains the raw pin as its display label. The add
+menu continues to offer only the existing runnable model choices.
+When selected fallback rows have the same visible label, resolved rows include
+the provider ID; unresolved or same-provider duplicates include their position
+and stored pin instead. Display labels and move/remove accessible names use
+the same resolved identity and status. The stored pin is unchanged. Saved pins
+that become unavailable stay visible and removable; reopening or editing another
+field must not drop them. Clearing the list saves `fallbackModels: []`. Inherit-session
 remains a primary-only choice. The hint explains that alternatives run after
 model retries fail, completed tool results are kept, and Stop cancels the whole
 task. See runtime §5f and ADR subagent-model-fallback.
@@ -251,16 +274,37 @@ If user selects model tagged without tools while in Agent mode:
 
 ## 6. Refresh behavior
 
-The pinned pi-ai 0.99.1 catalog is the startup baseline. Startup reads no remote
-catalog and uses no ambient credentials. `providers.refreshModelCatalog` invokes
-Pi's public refresh API; settings metadata lookups themselves are local.
+The bundled models.dev snapshot is the startup baseline. Startup reads no
+remote catalog and uses no ambient credentials. `providers.refreshModelCatalog`
+refreshes models.dev explicitly; settings metadata lookups themselves are local.
 
-For keyed endpoints, live discovery supplies IDs and the central Pi catalog
-adapter enriches their metadata. For OAuth, the account provider refresh hook
-publishes live entitlement IDs into its existing Models collection. Successful
-account lists are authoritative; a failed list preserves the pinned baseline.
-Same-tier fallback for live-only IDs preserves transport and thinking behavior
-but cannot invent known prices.
+For keyed endpoints, live discovery supplies IDs and models.dev enriches their
+metadata. A positive safe integer context/input or output limit reported on a live
+model-list row takes precedence over the catalog for that field; each field
+falls back independently to catalog metadata when the endpoint omits it. An
+omitted or non-positive value is not guessed. For OAuth, the live account
+endpoint supplies entitled IDs, which are then enriched from models.dev.
+Successful account lists are authoritative; a failed list preserves the last
+usable IDs. A live-only ID with no service or catalog capacity stays generic;
+pi-ai sibling metadata never supplies its chat limits, reasoning or price.
+
+For an unanchored OpenAI-compatible relay, a known model family may use the
+weight owner's published record when that owner names the model. This record
+outranks shared reseller matches without changing the configured wire ID.
+Lookup accepts dotted/dashed version notation, one whitelisted deployment
+label, and the owner's published canonical generation ID; semantic variants
+and unpublished generations remain distinct. The owner's own sibling keys
+(regional, token-plan and coding-plan) are consulted as added evidence when the
+public key states nothing, so a generation the vendor ships only on one of its
+keys still resolves; a sibling key never vetoes an answer the public key
+already gave. When the relay names a generation the owner publishes under
+another ID, models.dev's own canonical declaration translates the name, but
+only when at least two distinct publishers corroborate the same owner-prefixed
+target and the ordinary lookup resolved nothing — the capacity still comes from
+the owner's record for the translated ID, never from the declarers. If owner
+aliases disagree on capabilities or limits, no owner record is borrowed. When
+the owner publishes no matching record, the existing shared catalog matching
+rules still apply.
 
 `source: "cache"` reads Host caches and configured bindings without network.
 `source: "refresh"` probes the selected endpoint/account and decorates returned
@@ -277,9 +321,9 @@ If refresh fails / offline:
 - allow custom model id
 - still allow providers with known model ids
 - when a saved provider cache is empty or partial, append every configured
-  model binding before applying Pi catalog metadata decoration, so multi-model
+  model binding before applying models.dev metadata decoration, so multi-model
   settings remain editable and per-model capability state stays aligned
-- if no matching pinned Pi metadata is available offline, keep the configured IDs visible with generic text-only metadata
+- if no matching bundled models.dev metadata is available offline, keep the configured IDs visible with generic metadata
 
 ## 8. Catalog item schema
 
@@ -306,7 +350,7 @@ type ModelCatalogItem = {
     "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
   >
   /** Which known catalog supplied metadata for this row. */
-  catalogSource?: "pi"
+  catalogSource?: "models.dev"
 }
 ```
 
@@ -316,13 +360,13 @@ When UI/search requests models for picker:
 
 1. recent models for enabled providers
 2. user-defined models
-3. Pi catalog records for the matching provider/API URL
+3. models.dev records for the matching provider/API URL
 4. provider discovery/cache for custom or account-specific models
 5. always include "custom model id" entry action
 
 Deduplicate by `(providerId, modelId)` with priority:
-`user > Pi catalog > provider-discovered > recent-only`. The `catalogSource`
-field records a Pi catalog match; a provider cache stores only normalized
+`user > models.dev catalog > provider-discovered > recent-only`. The `catalogSource`
+field records a models.dev match; a provider cache stores only normalized
 selection fields and is re-decorated from the local raw catalog on the next
 read.
 
@@ -333,11 +377,11 @@ model window and output cap. Bindings record their provenance independently:
 `contextWindowSource` belongs to `contextWindow`, and `maxTokensSource` belongs
 to `maxTokens`.
 
-- `catalog` — that limit is a Pi catalog snapshot, so a later correction to its
-  published field replaces it. A refreshed context such as `gpt-5.6-luna`
+- `catalog` — that limit is a models.dev snapshot, so a later correction to its
+  published field replaces it. A refreshed context such as `gpt-6.1-sol`
   (`1,050,000` tokens) stops appearing as a 128k model, and a row added while
   nothing published its id stops reporting the generic 8.2k output once the
-  record resolves. Only a resolved Pi catalog record counts as published: when
+  record resolves. Only a resolved models.dev record counts as published: when
   lookup falls back to the generic shape (for example a gateway serving an id
   several publishers list), its 128k / 8.2k values are not a correction and the
   stored catalog snapshot stays in force.
@@ -350,8 +394,11 @@ Bindings written before either marker preserve their stored window and output
 cap, including 128,000 and 8,192, because old records cannot distinguish generic
 seeds from user choices. Only explicit `catalog` provenance follows later
 corrections. Unknown models use conservative
-128k / 8.2k limits and are never promoted from an ID pattern alone. Both markers
-are optional, so old configs remain readable and downgrade clients ignore them.
+128k / 8.2k runtime limits and are never promoted from an ID pattern alone.
+Settings shows an em dash for an unpublished limit unless the user explicitly
+configured that value; the Advanced inputs retain the conservative runtime
+limits until the user edits them. Both markers are optional, so old configs
+remain readable and downgrade clients ignore them.
 
 The configured user value remains persisted and visible in Advanced settings, but
 provider safety does not trust an enlarged override beyond a known published
@@ -389,34 +436,36 @@ duplicate accounts from one vendor remain distinguishable; Composer model rows
 show the configured wire model ID, while a configured alias remains available
 as the compact selected-chip label.
 
-## 10. Default model policy
+## 10. Recent chat model policy
 
-App-level default:
-- first successfully tested provider + its default/recommended model
-- the Settings default-model picker lists every configured model under its provider; selecting an entry persists both the owning provider and that exact model ID
-- saving that provider preserves the selected app-default model while it remains configured; removing it falls back to the first remaining binding
-- the picker supports local search across provider name and model ID; its result list scrolls within the floating surface and shows an explicit empty state when no model matches
-- the picker uses concise settings-specific search copy; each result gives visual priority to the model ID and keeps the provider as secondary metadata
-- results are grouped by provider so a provider name is shown once per group rather than repeated on every model row
-- a provider is named the same way here as in the Composer menu: an OAuth row
-  uses its non-secret account label when present, so two accounts of one vendor
-  stay distinguishable in the group heading, in the summary line that reports
-  the current default, and in each option's accessible name. Search matches the
-  account label and the vendor name, so either spelling reaches the row
-- the Settings prompt-enhancement model picker reuses this menu and resolves its
-  provider names the same way
-- if none configured, onboarding checklist requires provider setup before first agent run
+New desktop chats inherit the most recently used available chat
+model. An explicit draft selection takes precedence; existing sessions retain
+their pinned provider/model pair. Selecting or submitting an existing chat does
+not change another chat's binding. Opening a chat alone does not reorder history.
 
-Session-level:
-- inherits app default at creation and stores that `providerId`/`modelId` pair
-- later Settings default-model changes apply only to new sessions and the
-  unpersisted home draft, not to already created sessions
-- initializes thinking from the inherited model's binding default. A known
-  reasoning model with no stored default falls back to its highest enabled
-  level; an unmatched model with no stored default starts at `off` while its
-  canonical thinking levels remain selectable in Composer. An empty or
-  `off`-only binding starts at `off`
-- can override independently
+The renderer stores up to 20 provider/model pairs in the local UI preferences,
+newest first, deduplicated by provider ID and case-insensitive full wire model ID.
+Only accepted message submission updates history, using that submission's
+provider/model pair. Selecting a model, changing reasoning, or applying deferred
+configuration alone does not count as usage. Rejected submissions do not replace
+the preference. Sending in an older chat does update the recent usage order. This preference survives renderer reload and app
+restart and is not part of cloud configuration sync.
+
+Inheritance skips deleted, disabled, unauthenticated and image-generation
+bindings. With no usable history it uses a valid legacy app selection, otherwise
+the first available configured chat binding. Legacy settings and provider default
+fields remain readable for scheduled jobs and older consumers; no database or
+IPC migration is required. Settings has no fixed chat-default picker or service
+"Make default" action. Image-generation selection remains independent.
+
+The combined Composer model menu shows the three most recent available bindings
+first. Each row identifies the provider as well as the model or alias. Search is
+always visible and searches all configured models. Other models expand inline,
+grouped by provider, without duplicating recent entries. With no history, all
+models are visible immediately. The current model is checked; reasoning controls
+remain below the list. Discovery enriches exact
+configured IDs without adding unconfigured choices. Model and reasoning changes
+retain the existing session configuration and permission boundaries.
 
 ## 11. Capability gating
 
@@ -428,6 +477,8 @@ Session-level:
 | structured repair helpers | `json` optional |
 
 Warnings are non-blocking unless execution is impossible.
+
+Composer context-window labels resolve the exact binding with `effectiveContextWindow`: explicit user limits override discovery, catalog-owned limits follow discovery, and legacy bindings preserve their saved limits. A binding with a valid saved limit still displays it when discovery is unavailable. This display resolution does not modify the discovered catalog or runtime safety budgets.
 
 ### 11.1 Reasoning capability resolution
 
@@ -502,10 +553,10 @@ generic metadata and explicit binding overrides.
 - refresh failures keep previous cache and surface non-fatal error
 
 Electron decorates cached and freshly returned model rows from the local
-Pi catalog snapshot. Runtime model resolution passes the same full Pi catalog
-configuration to the selected pi-ai transport adapter. Provider discovery
-remains an ID-only fallback for custom/account-specific models absent from the
-snapshot.
+models.dev snapshot. Runtime model resolution uses the same resolved metadata
+for limits and capabilities while pi-ai remains the selected transport
+adapter. Provider discovery remains the ID source for custom/account-specific
+models absent from the snapshot.
 
 ## 13. Search behavior
 
@@ -558,11 +609,12 @@ same model to the check mark, the toggle and the duplicate guard.
 - [ ] the settings picker always exposes the canonical thinking ladder;
       published levels seed known models and explicit binding levels clamp the
       same way in Composer, Electron main, and the pi sidecar
-- [ ] Pi catalog metadata wins for a matching provider/model; an ID absent from
-      it uses the generic shape while pi-ai supplies only transport/OAuth
+- [ ] models.dev metadata wins for a matching provider/model; an ID absent from
+      it uses the generic shape while pi-ai supplies only transport/OAuth and
+      typed non-chat operation support
 - [ ] provider settings and cached discovery cannot replace known catalog
       capabilities; explicit binding edits remain persisted configuration
-- [ ] a Pi catalog limit correction reaches an already saved `catalog` binding
+- [ ] a models.dev limit correction reaches an already saved `catalog` binding
       without deleting and re-adding the model, while a number the user entered in
       Advanced (`user`) survives every correction, a hand-entered `128,000`
       included
@@ -572,7 +624,7 @@ same model to the check mark, the toggle and the duplicate guard.
 - [ ] the provenance marker survives a provider save/read round trip and an
       unmarked record keeps working
 - [ ] unknown free-form models remain runnable without invented capabilities
-- [ ] a Pi catalog record and an unknown generic record resolve through the same
+- [ ] a models.dev record and an unknown generic record resolve through the same
       selected transport without sending provider credentials to the remote catalog
 - [ ] compact limit text never reads above the published value, keeps the
       neighbouring 1M-line windows apart (`1M` / `1.05M` / `1.1M`), and never

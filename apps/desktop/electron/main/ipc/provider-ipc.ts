@@ -260,6 +260,17 @@ export function registerProviderIpc({
         baseUrl,
         apiKey: secret.value,
         apiStyle: detail.provider?.apiStyle,
+        /*
+          Resolved the same way the model list is resolved, so a service that
+          publishes its model list in another style than it generates in (a
+          subscription plan on Anthropic Messages) is tested with the
+          credentials that actually answer.
+        */
+        discoveryStyle: inferEndpointProfile({
+          baseUrl,
+          apiStyle: normalizeApiStyle(detail.provider?.apiStyle),
+          explicitApiStyle: true,
+        })?.discoveryStyle,
         headers: detail.provider?.headers,
         signal: controller.signal,
       });
@@ -445,11 +456,18 @@ export function registerProviderIpc({
             };
         return {
           ...info,
+          // Catalog enrichment must not turn a configured-only row into
+          // evidence that the endpoint still serves it.
+          source: model.source ?? info.source,
           modelId: model.modelId,
           displayName: info.displayName || modelConfig.name,
           providerId: provider?.id ?? "",
-          contextWindow: operationMetadata?.contextWindow ?? modelConfig.contextWindow,
-          maxTokens: operationMetadata?.maxTokens ?? modelConfig.maxTokens,
+          // The service's own model-list row states what it actually gives;
+          // an endpoint that reports capacity outranks both the catalog and
+          // any stored value it carries (PiDeck parity: reported > catalog >
+          // nothing — an omission is never a guess).
+          contextWindow: model.contextWindow ?? operationMetadata?.contextWindow ?? modelConfig.contextWindow,
+          maxTokens: model.maxTokens ?? operationMetadata?.maxTokens ?? modelConfig.maxTokens,
           // Published modalities, taken before the binding is applied. This
           // record is what the settings panel compares its checkboxes against,
           // so letting a stored override shape it would make the override its
@@ -459,7 +477,7 @@ export function registerProviderIpc({
           // ModelInfo is catalog metadata. Keep its published reasoning fields
           // intact; Composer and runtime resolve the exact user binding when
           // they need effective per-provider capabilities.
-          ...(modelsDevModel ? { catalogSource: "pi" as const } : {}),
+          ...(modelsDevModel ? { catalogSource: "models.dev" as const } : {}),
         };
       };
 

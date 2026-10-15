@@ -44,6 +44,14 @@ sent only to the frame that owns the call.
 OAuth tokens and API keys remain in Main. SDP, audio and transcript content are
 not logged. Main WebSocket endpoints are validated before connection and use
 the configured desktop network proxy. Unsupported proxy routes fail closed.
+Codex SDP negotiation stays HTTPS-only and the Gemini endpoint is third-party
+and requires `wss`. The OpenAI Realtime Provider base URL is user-supplied
+(ADR 0304): an `https` base URL connects over `wss`, and an `http` base URL
+connects over plain `ws` only when the network guard accepts it under
+`networkPolicy.mode` (`relaxed`, the default; `strict` refuses it). A plain `ws` endpoint is never sent through a
+proxy tunnel; a proxied route for it fails closed with
+`LIVE_NETWORK_POLICY_UNSUPPORTED`. Base URLs with credentials, a query or a
+fragment are refused.
 The PCM port exists for one prepared call, has bounded frame sizes and credits,
 and carries no credentials.
 
@@ -172,6 +180,13 @@ settings and its Composer entry are hidden; existing `voice` values and the
 underlying Dictation capability remain unchanged and are not deleted or rewritten
 by the UI. Old settings with no `liveVoice` value read as disabled with no
 bindings.
+
+When the hidden local Dictation capability loads an STT model, it releases the
+model after ten minutes in a terminal phase without a new recording. Starting a
+recording cancels a pending unload; a later recording lazily reloads the model
+from its on-disk cache. This changes idle memory use and the first-recording
+latency after a long idle period, but does not alter Dictation settings or the
+downloaded model files.
 
 Live DTOs and IPC contracts live in `packages/shared`. Pure wire parsing and
 PCM math are exported only from `@pi-desktop/voice-runtime/live`; they do not

@@ -1,3 +1,4 @@
+import { transcriptCompat } from "./transcript-compat.js";
 /**
  * Provider/model wiring shared by the session runtime and its subagents.
  *
@@ -33,6 +34,7 @@ import {
   OPENCODE_GO_API_STYLE,
   OPENCODE_GO_BASE_URL,
   resolveApiStyle,
+  normalizeApiStyle,
   resolveNativeWebSearch,
   nativeWebSearchTransport,
   deepseekRequestCompat,
@@ -40,6 +42,7 @@ import {
   type ThinkingLevel,
 } from "@pi-desktop/shared";
 import { genericModelConfig } from "./model-capabilities.js";
+import { sessionAffinityCompat } from "./session-affinity.js";
 import type { ModelConfig } from "./thinking-level.js";
 
 export type RuntimeProviderConfig = {
@@ -109,17 +112,47 @@ export function adapterAcceptsCustomFetch(api: Api | undefined): boolean {
   return api !== "google-generative-ai" && api !== "google-vertex";
 }
 
+const NO_AUTH_REQUEST_KEY = "pi-desktop-no-auth";
+const API_KEY_HEADERS = new Set(["api-key", "x-api-key", "x-goog-api-key"]);
+
+function withoutNoAuthCredential(fetchFn: FetchFunction): FetchFunction {
+  return (input, init) => {
+    const headers = new Headers(
+      init?.headers ?? (input instanceof Request ? input.headers : undefined),
+    );
+    for (const [name, value] of [...headers]) {
+      const normalizedName = name.toLowerCase();
+      const trimmedValue = value.trim();
+      const bearerValue = trimmedValue.slice(0, 7).toLowerCase() === "bearer "
+        ? trimmedValue.slice(7).trim()
+        : undefined;
+      const isPlaceholderApiKey = API_KEY_HEADERS.has(normalizedName)
+        && trimmedValue === NO_AUTH_REQUEST_KEY;
+      const isPlaceholderAuthorization = normalizedName === "authorization"
+        && (trimmedValue === NO_AUTH_REQUEST_KEY || bearerValue === NO_AUTH_REQUEST_KEY);
+      if (isPlaceholderApiKey || isPlaceholderAuthorization) {
+        headers.delete(name);
+      }
+    }
+    return fetchFn(input, { ...(init ?? {}), headers });
+  };
+}
+
 /**
  * The `fetch` one request may hand to `api`'s adapter: the caller's wrapper
  * where the adapter accepts one, otherwise nothing. Callers keep building the
  * wrapper (response capture, header override); this only decides whether it
- * reaches the adapter.
+ * reaches the adapter. No-auth requests also strip pi-ai's required placeholder
+ * credential before the request leaves the runtime.
  */
 export function providerRequestFetch(
   api: Api | undefined,
   fetchFn: FetchFunction | undefined,
+  authKind?: string,
 ): FetchFunction | undefined {
-  return adapterAcceptsCustomFetch(api) ? fetchFn : undefined;
+  if (!adapterAcceptsCustomFetch(api)) return undefined;
+  if (authKind !== "none") return fetchFn;
+  return withoutNoAuthCredential(fetchFn ?? globalThis.fetch.bind(globalThis));
 }
 
 /** Map a stored provider apiStyle onto a pi-ai wire API. Unknown styles fall
@@ -173,26 +206,49 @@ export function apiBindingForStyle(apiStyle?: string): ApiBinding {
   }
 }
 
-/** The key pi-ai signs requests with; `none` auth still needs a placeholder. */
+/** The API key pi-ai signs requests with; no-auth uses a stripped placeholder. */
 export function providerRequestKey(provider: RuntimeProviderConfig): string {
-  return (
-    provider.apiKey || (provider.authKind === "none" ? "pi-desktop-no-auth" : "")
-  );
+  return provider.authKind === "none"
+    ? NO_AUTH_REQUEST_KEY
+    : provider.apiKey;
 }
 
 /**
  * Resolve the wire API for one provider row. A catalog entry may pin a wire
  * API that differs from the provider-wide style (e.g. responses-only models
  * under an opencode_go provider, which defaults to Chat Completions). Honor
- * the model-level api when present so such models are not sent through the
- * wrong adapter (the gateway answers 500, see #105).
+ * the model-level api when compatible or when the provider has no explicit
+ * wire style; never let a foreign-family catalog match (e.g. Google Generative AI
+ * on a Gemini model served by an OpenAI-compatible relay) overwrite the provider's
+ * wire protocol (see #105, #1310).
  */
 export function apiBindingForProviderModel(provider: RuntimeProviderConfig): ApiBinding {
   return apiBindingForStyle(providerRequestTransport(provider).apiStyle);
 }
 
 function providerRequestTransport(provider: RuntimeProviderConfig) {
-  const apiStyle = resolveApiStyle(provider.modelConfig?.api) ?? provider.apiStyle;
+  const modelStyle = resolveApiStyle(provider.modelConfig?.api);
+  const resolvedProviderStyle = resolveApiStyle(provider.apiStyle);
+  const providerStyle = resolvedProviderStyle ?? (provider.apiStyle ? normalizeApiStyle(provider.apiStyle) : undefined);
+  const customEndpoint = provider.vendorKey?.trim().toLowerCase() === "custom";
+  const isOpenAiStyle = (style: string | undefined) =>
+    style === "chat_completions" ||
+    style === "responses" ||
+    style === "openai_codex_responses" ||
+    style === OPENCODE_GO_API_STYLE;
+  const isCompatible =
+    !providerStyle ||
+    !modelStyle ||
+    modelStyle === providerStyle ||
+    (isOpenAiStyle(providerStyle) && isOpenAiStyle(modelStyle));
+  // A custom endpoint's saved API format describes the user's actual gateway.
+  // Published model metadata may describe another publisher's default adapter;
+  // it cannot silently retarget that request. Other providers may use a
+  // compatible model-level pin, such as OpenCode Go's Responses route (#105),
+  // but foreign catalog protocols must not replace the provider's wire style.
+  const apiStyle = customEndpoint
+    ? provider.apiStyle ?? modelStyle
+    : (isCompatible ? modelStyle : undefined) ?? provider.apiStyle;
   return nativeWebSearchTransport({
     apiStyle,
     baseUrl: provider.baseUrl ?? provider.modelConfig?.baseUrl ?? apiBindingForStyle(apiStyle).defaultBaseUrl,
@@ -288,7 +344,7 @@ export function buildProviderModel(
   const binding = apiBindingForProviderModel(provider);
   const catalog = provider.modelConfig;
   const catalogModel = catalog
-    ? (({ source: _source, nativeCost, ...model }) => ({
+    ? (({ source: _source, transcriptBinding: _transcriptBinding, nativeCost, ...model }) => ({
         ...model,
         ...(nativeCost ? { cost: nativeCost } : {}),
       }))(catalog)
@@ -318,12 +374,26 @@ export function buildProviderModel(
   const modelHeaders = {
     ...(copilotDefaults ?? {}),
     ...(catalogModel.headers ?? {}),
+    ...(provider.authKind === "none" && binding.api === "google-generative-ai"
+      ? { "x-goog-api-key": "" }
+      : {}),
   };
   const thinkingProtocolCompat = catalogModel.thinkingProtocol
     ? { forceAdaptiveThinking: catalogModel.thinkingProtocol === "adaptive" }
     : undefined;
   const autoAdaptiveThinking =
     catalogModel.thinkingProtocol === undefined && requiresAdaptiveThinking(catalogModel);
+  // A generic model projection can still be present when the catalog misses a
+  // model (#926). OAuth vendor rows may expose live-only Claude ids, so only
+  // use the id heuristic for non-OAuth rows without protocol or options.
+  const customClaudeId =
+    catalog?.source === "generic" &&
+    provider.authKind !== "oauth" &&
+    catalogModel.reasoning === true &&
+    catalogModel.thinkingProtocol === undefined &&
+    (catalogModel.reasoningOptions?.length ?? 0) === 0 &&
+    binding.api === "anthropic-messages" &&
+    /claude/i.test(provider.modelId);
   // OpenAI-compatible gateways are not guaranteed to implement the newer
   // `developer` role, even when the selected model supports reasoning. Keep
   // the broadest Chat Completions wire shape as the default; a catalog/model
@@ -340,11 +410,18 @@ export function buildProviderModel(
           supportsDeveloperRole: catalogModel.compat?.supportsDeveloperRole === true,
         }
       : binding.api === "anthropic-messages" &&
-          (catalogModel.thinkingProtocol === "adaptive" || autoAdaptiveThinking)
+          (catalogModel.thinkingProtocol === "adaptive" ||
+            autoAdaptiveThinking ||
+            customClaudeId)
         ? {
             ...(catalogModel.compat ?? {}),
             ...(thinkingProtocolCompat ?? {}),
-            forceAdaptiveThinking: true,
+            // Explicit protocol selection wins, followed by per-model compat;
+            // the Claude-id heuristic supplies only the missing default.
+            forceAdaptiveThinking:
+              thinkingProtocolCompat?.forceAdaptiveThinking ??
+              catalogModel.compat?.forceAdaptiveThinking ??
+              true,
           }
         : thinkingProtocolCompat
           ? { ...(catalogModel.compat ?? {}), ...thinkingProtocolCompat }
@@ -362,7 +439,13 @@ export function buildProviderModel(
       }) === "on"
         ? true
         : undefined,
-    ...(compat ? { compat } : {}),
+    // The session-affinity default sits under the row's own compat, so a
+    // catalog entry that already answers the question keeps its answer.
+    compat: {
+      ...(sessionAffinityCompat(provider, binding.api, baseUrl) ?? {}),
+      ...compat,
+      ...transcriptCompat(catalog, provider.modelId, binding.api, baseUrl),
+    },
     ...(Object.keys(modelHeaders).length > 0 ? { headers: modelHeaders } : {}),
   } as Model<Api>;
 }

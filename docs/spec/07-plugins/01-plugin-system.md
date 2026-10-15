@@ -220,6 +220,10 @@ are reachable there) and CPU/memory limits.
 ### 6.3 Plugin Panel UI
 - Load the plugin page in a dedicated sandboxed `BrowserWindow` and isolated
   per-plugin session partition
+- Keep a newly created panel hidden until its initial page load settles. Bound
+  that wait to 15 seconds; if it does not settle, destroy the hidden window and
+  reject the open request with `PANEL_LOAD_TIMEOUT`. Preserve the original error
+  when the page load fails on its own.
 - Closing a panel (capsule close, disable, uninstall, or crash teardown) must
   not read a destroyed `BrowserWindow` or its `webContents`. The host copies
   any contents identity needed for drop-record cleanup while the window is
@@ -538,6 +542,18 @@ Rules the control encodes:
 
 ### 12.3 Skills management in Settings > Agent
 
+- The page lists bundled skills in a **Built-in skills** group above the
+  user-owned global and project groups. Each bundled skill has a global
+  enablement switch, enabled by default. The user can turn a bundled skill off
+  without editing or removing its packaged document.
+- A disabled bundled skill is omitted from the effective session catalog and
+  Composer's `/skill:<id>` entries. A stale direct `Skill` load reports that
+  the skill is disabled. The activation state lives in the separate
+  `<data>/agent-capabilities/skill-builtins.json` file so scans of user-owned
+  documents cannot prune it.
+- Built-in skill activation controls the skill catalog and on-demand document
+  loading only. It does not disable or unregister any agent tool associated
+  with the skill; tool activation remains independent.
 - The Skills page has independent global and selected-project columns rooted at
   `~/.agents/skills` and `<project>/.agents/skills`.
 - Each column has a native single-file Import action and a folder Import action

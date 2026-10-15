@@ -39,6 +39,14 @@ test("agent settings have three independent destinations and extensions have two
   assert.doesNotMatch(pluginsPage, /plugins-(?:tab|panel)-(?:mcp|skills|subagents)/);
 });
 
+test("bundled skill activation validates the catalog and writes host-owned state", () => {
+  assert.match(skillImport, /handle\(IPC\.invoke\.skillBuiltinList,[\s\S]*?disabledBuiltinSkills\(\)/);
+  assert.match(skillImport, /handle\([\s\S]*?IPC\.invoke\.skillBuiltinSetEnabled,[\s\S]*?typeof payload\.enabled !== "boolean"/);
+  assert.match(skillImport, /builtinSkillCatalog\(\)\.some\(\(skill\) => skill\.id === payload\.id\)/);
+  assert.match(skillImport, /host\.call\("skills\.setBuiltinEnabled"/);
+  assert.match(skillImport, /sendToRenderer\(IPC\.event\.pluginChanged, \{ reason: "skill" \}\)/);
+});
+
 test("skills and MCP filter one list by level instead of stacking two sections", () => {
   for (const source of [skills, mcp]) {
     assert.match(source, /useAgentProjects\(\)/);
@@ -78,14 +86,19 @@ test("one search field covers the page and every row carries its level", () => {
   assert.match(styles, /\.agent-capability-badge\.is-level\s*\{/);
 });
 
-test("skills keep the MCP-shaped toolbar and scope import actions in group headers", () => {
+test("skills keep file imports in group headers and expose the external scan in-page", () => {
   const toolbar = skills.slice(skills.indexOf("<CapabilityToolbar"), skills.indexOf("<CapabilityPanel"));
   assert.match(toolbar, /actions=\{[\s\S]*?CapabilityButton variant="primary"/);
   assert.match(toolbar, /settings\.newSkill/);
+  assert.match(toolbar, /ImportToggleButton/);
+  assert.match(toolbar, /settings\.importSkillFromTools/);
   assert.doesNotMatch(toolbar, /extensions\.skills\.add/);
-  assert.doesNotMatch(toolbar, /importSkill|IconDownload|settings\.importSkill/);
   assert.match(skills, /action=\{importButton\("global"\)\}/);
   assert.match(skills, /action=\{selectedProjectPath \? importButton\("project"\) : undefined\}/);
+  assert.match(skills, /<AgentSkillImportPanel/);
+  assert.match(skills, /level=\{targetLevel\}/);
+  assert.match(mcp, /<AgentMcpImportPanel/);
+  assert.match(mcp, /settings\.importMcpFromTools/);
   assert.match(layout, /action\?: ReactNode/);
 });
 

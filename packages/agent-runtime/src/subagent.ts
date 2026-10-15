@@ -24,7 +24,6 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
   Agent,
-  convertToLlm,
   type AfterToolCallContext,
   type AfterToolCallResult,
   type AgentEvent,
@@ -59,6 +58,7 @@ import type { RuntimeProviderConfig } from "./provider-binding.js";
 import { clampThinkingLevel } from "./thinking-level.js";
 import { subagentModelBinding, type SubagentProviderRetryState } from "./subagent-model-binding.js";
 import { contextBudgetFor } from "./context-budget.js";
+import { convertToLlm } from "./pi-runtime-messages.js";
 import {
   delegateRetentionMode,
   delegateSummaryModels,
@@ -127,6 +127,7 @@ export type SubagentRunResult = {
 export type SubagentToolOutcome = {
   isError?: boolean;
   terminate?: boolean;
+  error?: { code: string; message: string };
 };
 
 export type SubagentRunOptions = {
@@ -245,6 +246,7 @@ export class SubagentRun {
   private toolCalls = 0;
   private usage?: MessageUsage;
   private streamError?: { code: string; message: string };
+  private mutationTermination?: { code: string; message: string };
   /** Set when a settled message reads as a cancel — `stopReason: "aborted"`, or
    * a local marker whose preserved cause name is `AbortError`. pi-ai can wrap
    * an abort that fired before the parent signal flipped, so this is the only
@@ -384,6 +386,9 @@ export class SubagentRun {
     // session runtime reads that same marker as an aborted turn.
     if (this.turnAborted) {
       return this.result("aborted", "The delegated task was aborted.");
+    }
+    if (this.mutationTermination) {
+      return this.result("failed", this.lastReportText, this.mutationTermination);
     }
     if (caughtError) {
       if (caughtError.code === "TURN_ABORTED") {
@@ -741,6 +746,7 @@ export class SubagentRun {
     const parent = this.opts.resolveToolOutcome?.(context);
     const terminate = parent?.terminate === true;
     if (!parent?.isError && !terminate) return undefined;
+    if (terminate && parent?.error) this.mutationTermination = parent.error;
     return {
       ...(parent?.isError ? { isError: true } : {}),
       ...(terminate ? { terminate: true } : {}),

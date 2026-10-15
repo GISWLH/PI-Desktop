@@ -69,8 +69,15 @@ async function fixture(outcomes, run) {
   const events = [];
   const oauth = new VendorOAuth({ call: host.call, openExternal: async () => {}, emit: event => {
     events.push(event);
-    if (event.kind === "prompt") oauth.respond({ loginId: event.loginId,
-      promptId: event.request.promptId, value: "fixture-authorization-code" });
+    if (event.kind === "prompt") {
+      const value = event.request.type === "select"
+        ? "copy_code"
+        : event.request.type === "manual_code"
+          ? `fixture-authorization-code#${new URL(events.find(candidate =>
+              candidate.kind === "authUrl" && candidate.loginId === event.loginId).url).searchParams.get("state")}`
+          : undefined;
+      oauth.respond({ loginId: event.loginId, promptId: event.request.promptId, value });
+    }
   } });
   const signIn = async () => {
     await oauth.start("anthropic");
@@ -126,6 +133,18 @@ test("real refresh retries inside the provider lock and preserves request header
     assert.deepEqual(requests[0].body, requests[1].body);
     assert.ok(requests.every(req => req.headers["x-oauth-fixture"] === "preserved"));
     assert.equal(host.writes.length, 1);
+  });
+});
+
+test("token requests identify the client instead of inheriting a browser User-Agent", async () => {
+  // Electron's main-process fetch is net.fetch, which defaults to Chromium's
+  // "Mozilla/5.0 ..." User-Agent; the token endpoint answers that with a
+  // permanent 429 (issue #1337). Login and refresh must both send pi's own UA.
+  await fixture([{}], async ({ requests, signIn, oauth, seed }) => {
+    assert.equal((await signIn()).kind, "done");
+    await oauth.resolveAuth(seed());
+    assert.deepEqual(requests.map(req => req.body.grant_type), ["authorization_code", "refresh_token"]);
+    for (const req of requests) assert.match(req.headers["user-agent"], /^pi \(/);
   });
 });
 
