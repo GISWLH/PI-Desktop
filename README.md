@@ -1,3 +1,7 @@
+<!-- readme-visual-refresh:banner -->
+![PI-Desktop — hand-drawn project banner](assets/readme/banner.svg)
+<!-- /readme-visual-refresh:banner -->
+
 <div align="center">
 
 <img src="docs/image/readme/logo.png" alt="PI-Desktop" width="108" />
@@ -609,3 +613,7 @@ See [LICENSE](LICENSE) for details.
 <sub>macOS · Windows · Linux</sub>
 
 </div>
+
+<!-- readme-visual-refresh:artwork-source -->
+[Editable banner artwork · Excalidraw](assets/readme/banner.excalidraw)
+<!-- /readme-visual-refresh:artwork-source -->
